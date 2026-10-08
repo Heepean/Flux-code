@@ -15,8 +15,9 @@ interface LspLocation { uri: string; range: LspRange }
 
 export function fileUri(path: string) {
   const normalized = path.replaceAll('\\', '/')
-  const segments = normalized.split('/')
-  return `file:///${segments[0]}${segments.slice(1).map((segment) => `/${encodeURIComponent(segment)}`).join('')}`
+  const drivePath = /^[a-zA-Z]:\//.test(normalized)
+  const absolutePath = drivePath ? `/${normalized}` : normalized.startsWith('/') ? normalized : `/${normalized}`
+  return `file://${absolutePath.split('/').map((segment, index) => index === 0 ? '' : encodeURIComponent(segment)).join('/')}`
 }
 
 export class LanguageClient {
@@ -184,10 +185,11 @@ export class LanguageClient {
   registerProviders(monaco: Monaco, languageId: string) {
     if (this.registeredLanguages.has(languageId)) return
     this.registeredLanguages.add(languageId)
-    const request = (method: string, model: editor.ITextModel, position?: Position) => {
+    const request = (method: string, model: editor.ITextModel, position?: Position, extra: Record<string, unknown> = {}) => {
       const params = {
         textDocument: { uri: model.uri.toString() },
         ...(position ? { position: { line: position.lineNumber - 1, character: position.column - 1 } } : {}),
+        ...extra,
       }
       return this.request(method, params)
     }
@@ -211,9 +213,11 @@ export class LanguageClient {
         const response = await request('textDocument/definition', model, position)
         const locations = Array.isArray(response) ? response : response ? [response] : []
         return locations.flatMap((item) => {
-          const location = item as LspLocation
-          if (!location.uri || !location.range?.start || !location.range?.end) return []
-          return [{ uri: monaco.Uri.parse(location.uri), range: new monaco.Range(location.range.start.line + 1, location.range.start.character + 1, location.range.end.line + 1, location.range.end.character + 1) }]
+          const location = item as LspLocation & { targetUri?: string; targetSelectionRange?: LspRange; targetRange?: LspRange }
+          const uri = location.uri ?? location.targetUri
+          const range = location.range ?? location.targetSelectionRange ?? location.targetRange
+          if (!uri || !range?.start || !range?.end) return []
+          return [{ uri: monaco.Uri.parse(uri), range: new monaco.Range(range.start.line + 1, range.start.character + 1, range.end.line + 1, range.end.character + 1) }]
         })
       },
     }
@@ -229,7 +233,7 @@ export class LanguageClient {
     this.disposables.push(monaco.languages.registerHoverProvider(languageId, hoverProvider))
     const formattingProvider: languages.DocumentFormattingEditProvider = {
       provideDocumentFormattingEdits: async (model) => {
-        const edits = await request('textDocument/formatting', model) as { range: LspRange; newText: string }[] | null
+        const edits = await request('textDocument/formatting', model, undefined, { options: { tabSize: 2, insertSpaces: true } }) as { range: LspRange; newText: string }[] | null
         return (edits ?? []).map((edit) => ({
           range: new monaco.Range(edit.range.start.line + 1, edit.range.start.character + 1, edit.range.end.line + 1, edit.range.end.character + 1),
           text: edit.newText,
@@ -237,6 +241,20 @@ export class LanguageClient {
       },
     }
     this.disposables.push(monaco.languages.registerDocumentFormattingEditProvider(languageId, formattingProvider))
+  }
+
+  async formatDocument(uri: string) {
+    return await this.request('textDocument/formatting', {
+      textDocument: { uri },
+      options: { tabSize: 2, insertSpaces: true },
+    }) as { range: LspRange; newText: string }[] | null
+  }
+
+  async goToDefinition(uri: string, position: Position) {
+    return await this.request('textDocument/definition', {
+      textDocument: { uri },
+      position: { line: position.lineNumber - 1, character: position.column - 1 },
+    }) as LspLocation | LspLocation[] | { uri: string; targetUri: string; targetRange: LspRange }[] | null
   }
 
   async dispose() {

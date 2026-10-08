@@ -71,7 +71,7 @@ const labels = {
     fileName: 'Enter a file name relative to the project',
     terminal: 'Terminal',
     git: 'Source Control', commit: 'Commit', commitPlaceholder: 'Commit message', stage: 'Stage', unstage: 'Unstage', refreshGit: 'Refresh source control', noGitChanges: 'No changes detected', untrackedStatus: 'U', stageSymbol: '+', unstageSymbol: '−',
-    connectLanguageServer: 'Connect language server', stopLanguageServer: 'Stop language server', languageServerCommand: 'Language server command', languageServerArguments: 'Arguments as a JSON array', problems: 'Problems', noProblems: 'No problems detected', problemCount: 'Problems ({{count}})', problemLocation: '{{path}} · line {{line}}, column {{column}}', languageServerShort: 'LSP', debug: 'Run and debug', debugShort: 'DBG',
+    connectLanguageServer: 'Connect language server', stopLanguageServer: 'Stop language server', languageServerCommand: 'Language server command', languageServerArguments: 'Arguments as a JSON array', languageServerSetup: 'Language server setup (language, command, JSON args)', formatDocument: 'Format document', goToDefinition: 'Go to definition', formatLabel: 'Format', goToDefinitionTitle: 'Go to definition (F12)', formatTitle: 'Format document (Shift+Alt+F)', problems: 'Problems', noProblems: 'No problems detected', problemCount: 'Problems ({{count}})', problemLocation: '{{path}} · line {{line}}, column {{column}}', languageServerShort: 'LSP', debug: 'Run and debug', debugShort: 'DBG',
   },
   ru: {
     explorer: 'ПРОВОДНИК', openFolder: 'Открыть папку', newFile: 'Новый файл', newFolder: 'Новая папка', refresh: 'Обновить',
@@ -83,7 +83,7 @@ const labels = {
     fileName: 'Введите имя файла относительно папки проекта',
     terminal: 'Терминал',
     git: 'Контроль версий', commit: 'Зафиксировать', commitPlaceholder: 'Сообщение коммита', stage: 'Подготовить', unstage: 'Снять подготовку', refreshGit: 'Обновить Git', noGitChanges: 'Изменений нет', untrackedStatus: 'U', stageSymbol: '+', unstageSymbol: '−',
-    connectLanguageServer: 'Подключить языковой сервер', stopLanguageServer: 'Отключить языковой сервер', languageServerCommand: 'Команда языкового сервера', languageServerArguments: 'Аргументы в формате JSON-массива', problems: 'Проблемы', noProblems: 'Ошибок не обнаружено', problemCount: 'Проблемы ({{count}})', problemLocation: '{{path}} · строка {{line}}, столбец {{column}}', languageServerShort: 'LSP', debug: 'Запуск и отладка', debugShort: 'DBG',
+    connectLanguageServer: 'Подключить языковой сервер', stopLanguageServer: 'Отключить языковой сервер', languageServerCommand: 'Команда языкового сервера', languageServerArguments: 'Аргументы в формате JSON-массива', languageServerSetup: 'Настройка сервера (язык, команда, аргументы JSON)', formatDocument: 'Форматировать документ', goToDefinition: 'Перейти к определению', formatLabel: 'Форматировать', goToDefinitionTitle: 'Перейти к определению (F12)', formatTitle: 'Форматировать документ (Shift+Alt+F)', problems: 'Проблемы', noProblems: 'Ошибок не обнаружено', problemCount: 'Проблемы ({{count}})', problemLocation: '{{path}} · строка {{line}}, столбец {{column}}', languageServerShort: 'LSP', debug: 'Запуск и отладка', debugShort: 'DBG',
   },
 } as const
 
@@ -203,29 +203,50 @@ export function Workspace({ projectPath, language, onChooseProject }: WorkspaceP
   const languageServerRef = useRef<LanguageClient | null>(null)
   const breakpointDecorationIds = useRef<Record<string, string[]>>({})
   const breakpointHandlerRef = useRef<(event: MonacoEditor.IEditorMouseEvent, monaco: Monaco) => void>(() => undefined)
+  const goToDefinitionRef = useRef<() => Promise<void>>(async () => undefined)
+  const formatActiveDocumentRef = useRef<() => Promise<void>>(async () => undefined)
   const activeDocument = documents.find((document) => document.path === activePath)
   const rootName = projectPath.split(/[\\/]/).filter(Boolean).at(-1) || projectPath
 
-  const connectLanguageServer = async () => {
+  const connectLanguageServer = async (requestedLanguage?: string) => {
     if (!activeDocument) {
       setLanguageServerMessage(t.selectFile)
       return
     }
-    const languageId = languageForFile(activeDocument.path)
-    const configKey = `flux-code-language-server:${projectPath}:${languageId}`
+    const detectedLanguage = languageForFile(activeDocument.path)
+    const languageOptions = ['typescript', 'javascript', 'python', 'rust', 'go', 'json', 'html', 'css']
+    const languageId = requestedLanguage ?? (languageOptions.includes(detectedLanguage)
+      ? detectedLanguage
+      : window.prompt(t.languageServerSetup, 'typescript')?.trim().toLowerCase() ?? '')
+    if (!languageId) return
+    const configKey = `${workspaceStateKey}${projectPath}:lsp:${languageId}`
     let config: { command?: string; args?: string[] } = {}
     try { config = JSON.parse(localStorage.getItem(configKey) ?? '{}') as typeof config } catch { config = {} }
-    const command = window.prompt(t.languageServerCommand, config.command ?? '')?.trim()
-    if (!command) return
-    const rawArgs = window.prompt(t.languageServerArguments, JSON.stringify(config.args ?? []))
-    if (rawArgs === null) return
+    const presets: Record<string, { command: string; args: string[] }> = {
+      typescript: { command: 'typescript-language-server', args: ['--stdio'] },
+      javascript: { command: 'typescript-language-server', args: ['--stdio'] },
+      python: { command: 'pyright-langserver', args: ['--stdio'] },
+      rust: { command: 'rust-analyzer', args: [] },
+      go: { command: 'gopls', args: [] },
+      json: { command: 'vscode-json-language-server', args: ['--stdio'] },
+      html: { command: 'vscode-html-language-server', args: ['--stdio'] },
+      css: { command: 'vscode-css-language-server', args: ['--stdio'] },
+    }
+    const preset = presets[languageId]
+    const savedConfig = { command: config.command ?? preset?.command ?? '', args: config.args ?? preset?.args ?? [] }
+    const rawConfig = window.prompt(t.languageServerSetup, `${languageId}; ${savedConfig.command}; ${JSON.stringify(savedConfig.args)}`)
+    if (rawConfig === null) return
+    const [configuredLanguage, commandText, ...argsText] = rawConfig.split(';')
+    const finalLanguage = configuredLanguage?.trim().toLowerCase()
+    const command = commandText?.trim()
+    if (!finalLanguage || !command) { setLanguageServerMessage(t.languageServerSetup); return }
     let args: unknown
-    try { args = JSON.parse(rawArgs) } catch { setLanguageServerMessage(t.languageServerArguments); return }
+    try { args = JSON.parse(argsText.join(';').trim() || '[]') } catch { setLanguageServerMessage(t.languageServerArguments); return }
     if (!Array.isArray(args) || args.some((argument) => typeof argument !== 'string')) {
       setLanguageServerMessage(t.languageServerArguments)
       return
     }
-    localStorage.setItem(configKey, JSON.stringify({ command, args }))
+    localStorage.setItem(`${workspaceStateKey}${projectPath}:lsp:${finalLanguage}`, JSON.stringify({ command, args }))
     setLanguageServerMessage(t.loading)
     try {
       const previous = languageServerRef.current
@@ -235,7 +256,7 @@ export function Workspace({ projectPath, language, onChooseProject }: WorkspaceP
       await previous?.dispose()
       const client = await LanguageClient.start(
         projectPath,
-        languageId,
+        finalLanguage,
         command,
         args as string[],
         (uri, values) => {
@@ -243,6 +264,7 @@ export function Workspace({ projectPath, language, onChooseProject }: WorkspaceP
           let target = uri.startsWith('file:///') ? uri.slice('file:///'.length) : uri
           try { target = decodeURIComponent(target) } catch { /* Preserve the original URI path. */ }
           target = target.replaceAll('\\', '/')
+          if (/^[a-zA-Z]\//.test(target)) target = `${target[0]}:/${target.slice(2)}`
           const path = target.toLocaleLowerCase().startsWith(`${root.toLocaleLowerCase()}/`)
             ? target.slice(root.length + 1)
             : target
@@ -268,10 +290,10 @@ export function Workspace({ projectPath, language, onChooseProject }: WorkspaceP
         },
         setLanguageServerMessage,
       )
-      if (monacoRef.current) client.registerProviders(monacoRef.current, languageId)
+      if (monacoRef.current) client.registerProviders(monacoRef.current, finalLanguage)
       languageServerRef.current = client
       setLanguageServer(client)
-      setLanguageServerLanguage(languageId)
+      setLanguageServerLanguage(finalLanguage)
       setLanguageServerMessage('')
     } catch (cause) {
       setLanguageServerMessage(String(cause))
@@ -286,6 +308,62 @@ export function Workspace({ projectPath, language, onChooseProject }: WorkspaceP
     setLanguageServerMessage('')
     setProblems([])
   }
+
+  const formatActiveDocument = async () => {
+    const document = activeDocument
+    const editor = editorRef.current
+    const client = languageServerRef.current
+    if (!document || !editor || !client || languageServerLanguage !== languageForFile(document.path)) return
+    try {
+      const edits = await client.formatDocument(fileUri(`${projectPath}/${document.path}`))
+      if (edits?.length) {
+        const model = editor.getModel()
+        if (!model) return
+        editor.executeEdits('lsp-format', edits.map((edit) => ({
+          range: {
+            startLineNumber: edit.range.start.line + 1,
+            startColumn: edit.range.start.character + 1,
+            endLineNumber: edit.range.end.line + 1,
+            endColumn: edit.range.end.character + 1,
+          },
+          text: edit.newText,
+        })))
+        editor.focus()
+      }
+    } catch (cause) {
+      setLanguageServerMessage(String(cause))
+    }
+  }
+
+  const goToDefinition = async () => {
+    const document = activeDocument
+    const editor = editorRef.current
+    const client = languageServerRef.current
+    const position = editor?.getPosition()
+    if (!document || !editor || !client || !position) return
+    try {
+      const response = await client.goToDefinition(fileUri(`${projectPath}/${document.path}`), position)
+      const locations = Array.isArray(response) ? response : response ? [response] : []
+      const location = locations[0] as { uri?: string; targetUri?: string; range?: { start?: { line?: number; character?: number } }; targetRange?: { start?: { line?: number; character?: number } } } | undefined
+      const uri = location?.uri ?? location?.targetUri
+      const start = location?.range?.start ?? location?.targetRange?.start
+      if (!uri || typeof start?.line !== 'number' || typeof start.character !== 'number') return
+      const lineNumber = start.line + 1
+      const column = start.character + 1
+      const root = projectPath.replaceAll('\\', '/').replace(/\/$/, '')
+      let target = uri.startsWith('file:///') ? decodeURIComponent(uri.slice('file:///'.length)) : uri
+      target = target.replaceAll('\\', '/')
+      if (/^[a-zA-Z]\//.test(target)) target = `${target[0]}:/${target.slice(2)}`
+      if (!target.toLocaleLowerCase().startsWith(`${root.toLocaleLowerCase()}/`)) return
+      const relativePath = target.slice(root.length + 1)
+      await openFile({ path: relativePath, name: relativePath.split('/').at(-1) ?? relativePath, is_directory: false })
+      window.setTimeout(() => editorRef.current?.revealPositionInCenter({ lineNumber, column }), 80)
+    } catch (cause) {
+      setLanguageServerMessage(String(cause))
+    }
+  }
+  goToDefinitionRef.current = goToDefinition
+  formatActiveDocumentRef.current = formatActiveDocument
 
   const navigateToDebugFrame = async (sourcePath: string, line: number) => {
     let target = sourcePath.replaceAll('\\', '/')
@@ -309,7 +387,7 @@ export function Workspace({ projectPath, language, onChooseProject }: WorkspaceP
   useEffect(() => {
     const languageId = activeDocument ? languageForFile(activeDocument.path) : ''
     if (!languageServer || languageServerLanguage !== languageId || !activeDocument) return
-    languageServer.syncDocument(fileUri(`${projectPath}/${activeDocument.path}`), languageId, activeDocument.content)
+    languageServer.syncDocument(fileUri(`${projectPath}/${activeDocument.path}`), languageServerLanguage, activeDocument.content)
   }, [languageServer, languageServerLanguage, activeDocument?.path, activeDocument?.content, projectPath])
 
   useEffect(() => {
@@ -716,6 +794,10 @@ export function Workspace({ projectPath, language, onChooseProject }: WorkspaceP
         </div>
         {activeDocument ? <>
           <div className="ide-breadcrumb"><span>{rootName}</span><span className="ide-crumb-separator" /><span>{displayPath(activeDocument.path)}</span><span className="ide-save-status">{languageServerMessage || (activeDocument.content !== activeDocument.savedContent ? t.unsaved : t.saved)}</span>
+            {languageServer && languageServerLanguage === languageForFile(activeDocument.path) ? <>
+              <button type="button" className="ide-save-button" title={t.goToDefinitionTitle} onClick={() => void goToDefinition()}>{t.goToDefinition}</button>
+              <button type="button" className="ide-save-button" title={t.formatTitle} onClick={() => void formatActiveDocument()}>{t.formatLabel}</button>
+            </> : null}
             <button type="button" className="ide-save-button" onClick={() => void saveDocument()}>{t.save}</button>
           </div>
           <div className="ide-monaco-editor"><Editor
@@ -724,7 +806,7 @@ export function Workspace({ projectPath, language, onChooseProject }: WorkspaceP
             language={languageForFile(activeDocument.path)}
             value={activeDocument.content}
             onChange={updateActiveContent}
-            onMount={(instance, monaco) => { editorRef.current = instance; monacoRef.current = monaco; instance.onMouseDown((event) => breakpointHandlerRef.current(event, monaco)); if (languageServer && languageServerLanguage === languageForFile(activeDocument.path)) languageServer.registerProviders(monaco, languageServerLanguage) }}
+            onMount={(instance, monaco) => { editorRef.current = instance; monacoRef.current = monaco; instance.onMouseDown((event) => breakpointHandlerRef.current(event, monaco)); if (languageServer && languageServerLanguage === languageForFile(activeDocument.path)) languageServer.registerProviders(monaco, languageServerLanguage); instance.addAction({ id: 'flux-lsp-go-to-definition', label: t.goToDefinition, keybindings: [monaco.KeyCode.F12], run: () => goToDefinitionRef.current() }); instance.addAction({ id: 'flux-lsp-format-document', label: t.formatDocument, keybindings: [monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF], run: () => formatActiveDocumentRef.current() }) }}
             onValidate={(markers) => {
               const next = markers.map((marker) => ({ path: activePath, line: marker.startLineNumber, column: marker.startColumn, severity: marker.severity === 8 ? 1 : marker.severity === 4 ? 2 : marker.severity === 2 ? 3 : 4, message: marker.message }))
               setProblems((current) => [...current.filter((problem) => problem.path !== activePath), ...next])

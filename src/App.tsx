@@ -105,6 +105,8 @@ interface AgentFileAction {
   title?: string
   command?: string
   query?: string
+  start_line?: number
+  end_line?: number
 }
 
 interface PendingFileAction {
@@ -168,6 +170,17 @@ function parseAgentFileAction(content: string): { action: AgentFileAction; marke
     if (value.name === 'search_project') {
       if (typeof value.query !== 'string' || !value.query.trim()) return null
       return { action: { name: 'search_project', path: typeof value.path === 'string' ? value.path : '', query: value.query }, marker: match[0] }
+    }
+    if (value.name === 'read_file') {
+      return {
+        action: {
+          name: 'read_file',
+          path: typeof value.path === 'string' ? value.path : '',
+          ...(Number.isInteger(value.start_line) ? { start_line: Number(value.start_line) } : {}),
+          ...(Number.isInteger(value.end_line) ? { end_line: Number(value.end_line) } : {}),
+        },
+        marker: match[0],
+      }
     }
     if (typeof value.path !== 'string' || !value.path.trim()) return null
     if (value.name === 'write_file' && typeof value.content !== 'string') return null
@@ -1014,7 +1027,7 @@ function App() {
       `Supported actions: ${fullAccess ? 'read_file, write_file, create_pdf, list_directory, search_project, fetch_url, run_command' : 'read_file, write_file, create_pdf, list_directory, search_project'} . Request only one action at a time using exactly one marker at the end of your response:`,
       `<flux_action>{"name":"read_file","path":"${fullAccess ? 'C:/absolute/path/file.txt' : 'relative/path'}"}</flux_action>`,
       `<flux_action>{"name":"write_file","path":"${fullAccess ? 'C:/absolute/path/file.txt' : 'relative/path'}","content":"complete UTF-8 file contents"}</flux_action>`,
-      'read_file reads UTF-8 text and extracts text directly from DOCX and PDF files. search_project finds relevant file names and text snippets; read only the best matches. Large materials should be searched and read in relevant parts so the selected model context can handle them.',
+      'read_file reads UTF-8 text and extracts text directly from DOCX and PDF files. For large files, use start_line and end_line in 1-based ranges to read relevant parts. search_project finds relevant file names and text snippets; read only the best matches. Search skips common generated folders and credential files.',
       `For create_pdf, use the exact path and filename the user requested. In Full access, if the user did not specify a folder, use only a filename such as report.pdf; Flux Code saves it in Downloads. In other modes use a path inside the opened project.`,
       `<flux_action>{"name":"create_pdf","path":"${fullAccess ? 'report.pdf' : 'relative/path/report.pdf'}","title":"Document title","content":"Complete document text, with Markdown headings and paragraphs if useful"}</flux_action>`,
       `<flux_action>{"name":"list_directory","path":"${fullAccess ? 'C:/absolute/path/folder' : 'relative/folder'}"}</flux_action>`,

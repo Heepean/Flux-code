@@ -14,6 +14,12 @@ use serde::Deserialize;
 const MAX_DIRECTORY_ENTRIES: usize = 500;
 const MAX_WEB_BYTES: usize = 128 * 1024;
 const MAX_PDF_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SEARCH_RESULTS: usize = 40;
+const MAX_SEARCH_BYTES: usize = 48 * 1024;
+const SEARCH_CONTEXT_LINES: usize = 2;
+const MAX_SEARCH_FILES: usize = 8_000;
+const MAX_SEARCH_SCANNED_BYTES: usize = 128 * 1024 * 1024;
+const MAX_AGENT_READ_BYTES: usize = 256 * 1024;
 
 #[derive(Deserialize)]
 pub struct AgentAction {
@@ -25,6 +31,8 @@ pub struct AgentAction {
     pub title: Option<String>,
     pub command: Option<String>,
     pub query: Option<String>,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
 }
 
 fn extract_docx(path: &Path) -> Result<String, String> {
@@ -91,6 +99,58 @@ fn read_agent_file(path: &Path) -> Result<String, String> {
         }
         _ => fs::read_to_string(path)
             .map_err(|error| format!("Could not read the file as UTF-8 text: {error}")),
+    }
+}
+
+fn read_agent_file_chunk(
+    path: &Path,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> Result<String, String> {
+    let content = read_agent_file(path)?;
+    let lines = content.lines().collect::<Vec<_>>();
+    if let (Some(start), Some(end)) = (start_line, end_line)
+        && (start == 0 || end < start)
+    {
+        return Err("Line ranges are 1-based and end_line must be at least start_line".to_string());
+    }
+    let start = start_line.unwrap_or(1).max(1);
+    let end = end_line.unwrap_or_else(|| lines.len().max(1));
+    if start > lines.len() && !lines.is_empty() {
+        return Err(format!(
+            "start_line {start} is beyond the file's {} lines",
+            lines.len()
+        ));
+    }
+    let available = lines.len().saturating_sub(start.saturating_sub(1));
+    let selected_end = end.min(start.saturating_add(available.saturating_sub(1)));
+    let mut output = lines
+        .iter()
+        .enumerate()
+        .skip(start.saturating_sub(1))
+        .take(selected_end.saturating_sub(start).saturating_add(1))
+        .map(|(index, line)| format!("{}: {}", index + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if output.len() > MAX_AGENT_READ_BYTES {
+        let mut boundary = MAX_AGENT_READ_BYTES;
+        while !output.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        output.truncate(boundary);
+        output.push_str(
+            "\n[Output truncated. Request a smaller line range with start_line/end_line.]",
+        );
+    } else if end < lines.len() {
+        output.push_str(&format!(
+            "\n[File continues through line {}. Request another range to read more.]",
+            lines.len()
+        ));
+    }
+    if output.is_empty() {
+        Ok(format!("File is empty: {}", path.display()))
+    } else {
+        Ok(output)
     }
 }
 
@@ -212,6 +272,60 @@ struct SearchHit {
     preview: String,
 }
 
+fn ignored_project_path(relative: &Path, file_name: &str) -> bool {
+    let ignored_directories = [
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        ".next",
+        ".venv",
+        "venv",
+        "coverage",
+        "build",
+        "out",
+        "vendor",
+        ".idea",
+        ".vscode-test",
+    ];
+    if relative.components().any(|component| {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        let name = name.to_string_lossy();
+        ignored_directories
+            .iter()
+            .any(|ignored| name.eq_ignore_ascii_case(ignored))
+    }) {
+        return true;
+    }
+    let lower = file_name.to_ascii_lowercase();
+    let sensitive_names = [
+        ".env",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        "id_rsa",
+        "id_ed25519",
+        "credentials",
+        "secrets.json",
+        "secret.json",
+        "service-account.json",
+    ];
+    if sensitive_names.iter().any(|name| lower == *name)
+        || lower.starts_with(".env.")
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
+        || lower.ends_with(".p12")
+        || lower.ends_with(".pfx")
+        || lower.ends_with(".keystore")
+        || lower.ends_with(".jks")
+    {
+        return true;
+    }
+    false
+}
+
 fn search_project_text(root: &Path, query: &str) -> Result<String, String> {
     let terms = query
         .split_whitespace()
@@ -221,19 +335,14 @@ fn search_project_text(root: &Path, query: &str) -> Result<String, String> {
     if terms.is_empty() {
         return Err("Enter words or phrases to search for".to_string());
     }
-    let ignored = [
-        ".git",
-        "node_modules",
-        "target",
-        "dist",
-        ".next",
-        ".venv",
-        "venv",
-        "coverage",
-    ];
     let mut folders = vec![root.to_path_buf()];
     let mut hits = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut bytes_scanned = 0usize;
     while let Some(folder) = folders.pop() {
+        if files_scanned >= MAX_SEARCH_FILES || bytes_scanned >= MAX_SEARCH_SCANNED_BYTES {
+            break;
+        }
         let entries = fs::read_dir(&folder)
             .map_err(|error| format!("Could not search {}: {error}", folder.display()))?;
         for entry in entries.flatten() {
@@ -245,18 +354,18 @@ fn search_project_text(root: &Path, query: &str) -> Result<String, String> {
             }
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
+            let relative_path = path.strip_prefix(root).unwrap_or(&path);
+            if ignored_project_path(relative_path, &name) {
+                continue;
+            }
             if kind.is_dir() {
-                if !ignored
-                    .iter()
-                    .any(|ignored_name| name.eq_ignore_ascii_case(ignored_name))
-                {
-                    folders.push(path);
-                }
+                folders.push(path);
                 continue;
             }
             if !kind.is_file() {
                 continue;
             }
+            files_scanned += 1;
             let relative = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -280,30 +389,39 @@ fn search_project_text(root: &Path, query: &str) -> Result<String, String> {
                 Ok(file) => file,
                 Err(_) => continue,
             };
-            let mut reader = std::io::BufReader::new(file);
-            let mut line = String::new();
-            let mut line_number = 0;
-            loop {
-                line.clear();
-                match std::io::BufRead::read_line(&mut reader, &mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                line_number += 1;
-                if line.contains('\0') {
-                    break;
-                }
+            let remaining = MAX_SEARCH_SCANNED_BYTES.saturating_sub(bytes_scanned);
+            let mut bytes = Vec::new();
+            let mut limited = file.take(remaining.min(2 * 1024 * 1024) as u64);
+            if limited.read_to_end(&mut bytes).is_err() || bytes.contains(&0) {
+                continue;
+            }
+            bytes_scanned = bytes_scanned.saturating_add(bytes.len());
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let lines = text.lines().collect::<Vec<_>>();
+            for (index, line) in lines.iter().enumerate() {
                 let lower = line.to_lowercase();
                 let score = terms
                     .iter()
                     .filter(|term| lower.contains(term.as_str()))
                     .count();
                 if score > 0 {
+                    let start = index.saturating_sub(SEARCH_CONTEXT_LINES);
+                    let end = (index + SEARCH_CONTEXT_LINES + 1).min(lines.len());
+                    let preview = lines[start..end]
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, context)| {
+                            format!("{}: {}", start + offset + 1, context.trim())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     hits.push(SearchHit {
                         score,
                         path: relative.clone(),
-                        line: line_number,
-                        preview: line.trim().chars().take(300).collect(),
+                        line: index + 1,
+                        preview,
                     });
                 }
             }
@@ -320,18 +438,27 @@ fn search_project_text(root: &Path, query: &str) -> Result<String, String> {
         "Project search: {}\nRelevant results (best matches first):",
         query.trim()
     );
-    for hit in hits.into_iter().take(50) {
-        if hit.line == 0 {
-            result.push_str(&format!(
-                "\n{} [file name match]: {}",
-                hit.path, hit.preview
-            ));
+    let mut included_bytes = result.len();
+    for hit in hits.into_iter().take(MAX_SEARCH_RESULTS) {
+        let entry = if hit.line == 0 {
+            format!("\n{} [file name match]: {}", hit.path, hit.preview)
         } else {
-            result.push_str(&format!("\n{}:{}: {}", hit.path, hit.line, hit.preview));
+            format!("\n{}:{}:\n{}", hit.path, hit.line, hit.preview)
+        };
+        if included_bytes + entry.len() > MAX_SEARCH_BYTES {
+            result.push_str("\n[Search results truncated to fit the model context]");
+            break;
         }
+        included_bytes += entry.len();
+        result.push_str(&entry);
     }
     if result.ends_with("first):") {
         result.push_str("\nNo matching files or lines were found.");
+    }
+    if files_scanned >= MAX_SEARCH_FILES || bytes_scanned >= MAX_SEARCH_SCANNED_BYTES {
+        result.push_str(
+            "\n[Search stopped at the project scan limit; refine the query or search a subfolder]",
+        );
     }
     Ok(result)
 }
@@ -695,7 +822,7 @@ pub async fn execute_agent_action(
             if !target.exists() {
                 return Err("The requested file does not exist".to_string());
             }
-            read_agent_file(&target)
+            read_agent_file_chunk(&target, action.start_line, action.end_line)
         }
         "write_file" => {
             let content = action
