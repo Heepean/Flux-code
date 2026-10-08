@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Flux Code",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.fluxcode.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "UPDATER_PUBLIC_KEY_TO_CONFIGURE",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ2OUJEQURDQzcwNjNFQkYKUldTL1BnYkgzTnFiMWtYU0VyRFJMNTF0Sm5GTDJhME1BUUVSMnJIZjFoSzBmZ3IvWmYvRmZZTi8K",
       "endpoints": [
         "https://github.com/Heepean/flux-code/releases/latest/download/latest.json"
       ],
