@@ -1,0 +1,79 @@
+name: Release Windows app
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - name: Check signing secrets
+        shell: pwsh
+        env:
+          UPDATER_PUBLIC_KEY: ${{ secrets.UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:UPDATER_PUBLIC_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+            throw 'Configure UPDATER_PUBLIC_KEY, TAURI_SIGNING_PRIVATE_KEY, and TAURI_SIGNING_PRIVATE_KEY_PASSWORD repository secrets first.'
+          }
+      - name: Build signed updater bundle
+        run: npm run tauri build
+        env:
+          UPDATER_PUBLIC_KEY: ${{ secrets.UPDATER_PUBLIC_KEY }}
+          TAURI_CONFIG: '{"bundle":{"createUpdaterArtifacts":true},"plugins":{"updater":{"pubkey":"${{ secrets.UPDATER_PUBLIC_KEY }}"}}}'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Create update manifest
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $bundle = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*.nsis.zip' | Select-Object -First 1
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $bundle -or -not $installer) { throw 'NSIS installer or updater bundle was not generated.' }
+          $signature = "$($bundle.FullName).sig"
+          if (-not (Test-Path $signature)) { throw 'Updater signature was not generated. Check signing secrets.' }
+          $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME"
+          $manifest = @{
+            version = $version
+            notes = "Flux Code $version"
+            pub_date = (Get-Date).ToUniversalTime().ToString('o')
+            platforms = @{
+              'windows-x86_64' = @{
+                signature = (Get-Content $signature -Raw).Trim()
+                url = "$base/$($bundle.Name)"
+              }
+            }
+          } | ConvertTo-Json -Depth 6
+          Set-Content -Path latest.json -Value $manifest -Encoding utf8
+          "INSTALLER=$($installer.FullName)" >> $env:GITHUB_ENV
+          "UPDATER_BUNDLE=$($bundle.FullName)" >> $env:GITHUB_ENV
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          generate_release_notes: true
+          files: |
+            ${{ env.INSTALLER }}
+            ${{ env.UPDATER_BUNDLE }}
+            ${{ env.UPDATER_BUNDLE }}.sig
+            latest.json

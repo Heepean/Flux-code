@@ -1,0 +1,40 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "Local AI coding workspace with an integrated editor and agent"
+authors = ["Heepean"]
+license = "MIT"
+repository = "https://github.com/Heepean/flux-code"
+edition = "2024"
+rust-version = "1.90"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.12.1", features = [] }
+tauri-plugin-log = "2"
+futures-util = "0.3"
+keyring = { version = "3", features = ["windows-native"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+sysinfo = "0.33"
+tokio = { version = "1", features = ["fs", "io-util", "time"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tauri-plugin-dialog = "2.8.1"
+tauri-plugin-opener = "2.7.0"
+printpdf = { version = "0.12.8", default-features = false }
+portable-pty = "0.9.0"
+uuid = { version = "1", features = ["v4"] }
+quick-xml = "0.40"
+pdf-extract = "0.12"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
