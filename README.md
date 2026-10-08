@@ -16,8 +16,8 @@ Flux Code — локальная AI-среда разработки для Windo
 ### Подготовка первого релиза
 
 1. Создайте ключ командой `npm run tauri signer generate -- --write-keys "$env:APPDATA\Flux Code\updater\tauri-updater.key"` и задайте пароль в запросе CLI. Храните приватный ключ вне репозитория.
-2. В GitHub → **Settings → Secrets and variables → Actions** добавьте `UPDATER_PUBLIC_KEY` (содержимое файла `tauri-updater.key.pub`), `TAURI_SIGNING_PRIVATE_KEY` (содержимое приватного ключа) и `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (его пароль).
-4. Отправьте исходники в `Heepean/flux-code`, создайте тег версии `v0.1.0`, затем запустите workflow **Release Windows app** с этим тегом. Он опубликует установщик и подписанный `latest.json`.
+2. В настройках репозитория откройте **Settings → Secrets and variables → Actions** и добавьте `UPDATER_PUBLIC_KEY` (содержимое `tauri-updater.key.pub`), `TAURI_SIGNING_PRIVATE_KEY` (содержимое приватного ключа) и `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (его пароль).
+3. Создайте тег `v0.1.0` и запустите workflow **Release Windows app** с этим тегом. Он опубликует установщик и подписанный `latest.json`.
 
 Обычная локальная сборка создаёт стандартный установщик. Официальный workflow релиза включает updater-артефакты и использует secrets для подписи; если они не настроены, релизная сборка завершится ошибкой.
 
