@@ -26,6 +26,7 @@ interface ManagerStatus {
   version: string | null
   running: boolean
   port: number | null
+  context_size: number | null
 }
 
 interface MachineProfile {
@@ -143,6 +144,7 @@ interface ProviderSettings {
 const providerSettingsKey = 'flux-code-provider-settings'
 const autoUpdateKey = 'flux-code-auto-update'
 const internalToolResultPrefix = '[Flux Code agent action result]'
+const contextSizeOptions = [2048, 4096, 8192, 16384, 32768, 65536, 98304, 131072, 196608, 262144, 393216, 524288]
 
 function readFileAccessMode(): FileAccessMode {
   const mode = localStorage.getItem('flux-code-file-access-mode')
@@ -201,7 +203,9 @@ function userNamesFileTarget(message: string, path: string) {
 function estimateTokens(text: string) {
   let nonAscii = 0
   for (const character of text) if (character.charCodeAt(0) > 127) nonAscii += 1
-  return Math.ceil((text.length - nonAscii) / 4 + nonAscii / 2.2) + 8
+  // Non-ASCII tokenization varies substantially by language and model. Use a
+  // conservative estimate so Cyrillic-heavy prompts are not packed past n_ctx.
+  return Math.ceil((text.length - nonAscii) / 3 + nonAscii / 1.3) + 16
 }
 
 function compactMessages(messages: ChatMessage[], tokenBudget: number) {
@@ -322,8 +326,10 @@ function App() {
   const [machineProfile, setMachineProfile] = useState<MachineProfile | null>(null)
   const [selectedModel, setSelectedModel] = useState('')
   const [downloadFlavor, setDownloadFlavor] = useState<'cpu' | 'vulkan'>('cpu')
-  const [contextSize, setContextSize] = useState(2048)
-  const [contextSliderValue, setContextSliderValue] = useState(2048)
+  const [contextSize, setContextSize] = useState(() => {
+    const saved = Number(localStorage.getItem('flux-code-context-size'))
+    return Number.isInteger(saved) && saved >= 2048 && saved <= 524288 ? saved : 2048
+  })
   const [gpuLayers, setGpuLayers] = useState(0)
   const [memoryEstimate, setMemoryEstimate] = useState<MemoryEstimate | null>(null)
   const [memoryConfirmationRequired, setMemoryConfirmationRequired] = useState(false)
@@ -560,8 +566,11 @@ function App() {
         setMachineProfile(profile)
         setSelectedModel(local.gguf_files[0] ?? '')
         setDownloadFlavor(profile.supports_vulkan_asset ? 'vulkan' : 'cpu')
-        setContextSize(profile.supports_vulkan_asset ? profile.gpu_context : profile.cpu_context)
-        setContextSliderValue(profile.supports_vulkan_asset ? profile.gpu_context : profile.cpu_context)
+        const savedContextSize = Number(localStorage.getItem('flux-code-context-size'))
+        const initialContextSize = Number.isInteger(savedContextSize) && savedContextSize >= 2048 && savedContextSize <= 524288
+          ? savedContextSize
+          : profile.supports_vulkan_asset ? profile.gpu_context : profile.cpu_context
+        setContextSize(initialContextSize)
         setGpuLayers(profile.recommended_gpu_layers)
         setHfTokenConfigured(tokenConfigured)
         setLocalModels(storedModels)
@@ -725,10 +734,12 @@ function App() {
       setDownloadFlavor('vulkan')
       setGpuLayers(99)
       setContextSize(machineProfile.gpu_context)
+      localStorage.setItem('flux-code-context-size', String(machineProfile.gpu_context))
     } else {
       setDownloadFlavor('cpu')
       setGpuLayers(0)
       setContextSize(machineProfile?.cpu_context ?? 4096)
+      localStorage.setItem('flux-code-context-size', String(machineProfile?.cpu_context ?? 4096))
     }
   }
 
@@ -775,6 +786,41 @@ function App() {
       await refreshStatus()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const restartServerWithSelectedContext = async (confirmMemoryRisk = false) => {
+    if (!selectedModel || !managerStatus?.running) return
+    setBusy(true)
+    setError(null)
+    try {
+      const estimate = await invoke<MemoryEstimate>('estimate_model_memory', {
+        modelPath: selectedModel,
+        contextSize,
+        gpuLayers,
+      })
+      setMemoryEstimate(estimate)
+      if (!estimate.fits && !confirmMemoryRisk) {
+        setMemoryConfirmationRequired(true)
+        setError(t('memoryWarningDetail'))
+        return
+      }
+      setMemoryConfirmationRequired(false)
+      await invoke('stop_llama_server')
+      setCapabilities(null)
+      const port = await invoke<number>('start_llama_server', {
+        modelPath: selectedModel,
+        contextSize,
+        gpuLayers,
+      })
+      setManagerStatus(await invoke<ManagerStatus>('get_llama_manager_status'))
+      setCapabilities(await invoke<ModelCapabilities>('get_model_capabilities', { port, modelPath: selectedModel }))
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      await refreshStatus().catch(() => undefined)
     } finally {
       setBusy(false)
     }
@@ -1045,7 +1091,10 @@ function App() {
       localPort: provider === 'local' ? managerStatus?.port : null,
       messages: [
         { role: 'system', content: toolInstructions },
-        ...compactMessages(chat.messages, Math.floor((provider === 'local' ? contextSize : 8192) * 0.65)).map(({ role, content }) => ({ role, content })),
+        ...compactMessages(
+          chat.messages,
+          Math.floor(((provider === 'local' ? managerStatus?.context_size ?? contextSize : 8192) * 0.42)),
+        ).map(({ role, content }) => ({ role, content })),
       ],
     })
     if (generationRef.current?.chatId === chat.id && generationRef.current.assistantId === assistantId) {
@@ -1543,7 +1592,10 @@ function App() {
                 <button type="button" className={gpuLayers > 0 ? 'selected' : ''} disabled={!machineProfile?.supports_vulkan_asset} onClick={() => applyProfile('gpu')}>{t('rx7700')}</button>
               </div>
               <label className="control-label" htmlFor="context-size">{t('context')}</label>
-              <input id="context-size" type="range" min={2048} max={65536} step={1024} value={contextSize} onChange={(event) => { const value = Number(event.target.value); setContextSize(value); setContextSliderValue(value); setMemoryEstimate(null); setMemoryConfirmationRequired(false) }} aria-label={t('contextValue', { label: t('context'), value: contextSliderValue.toLocaleString() })} />
+              <select id="context-size" value={contextSize} onChange={(event) => { const value = Number(event.target.value); setContextSize(value); localStorage.setItem('flux-code-context-size', String(value)); setMemoryEstimate(null); setMemoryConfirmationRequired(false) }} aria-label={t('context')}>
+                {contextSizeOptions.map((size) => <option key={size} value={size}>{size.toLocaleString()} {t('tokens')}</option>)}
+              </select>
+              <small className="settings-notice">{t('largeContextWarning')}</small>
               {!managerStatus?.version ? <div className="settings-notice">{installProgress && !['complete', 'failed'].includes(installProgress.stage) ? t('runtimeInstallInProgress') : t('installRuntimeFirst')}</div> : null}
               <div className="manager-button-row">
                 <button type="button" className="manager-button primary" disabled={busy || !selectedModel || managerStatus?.running} onClick={() => managerStatus?.version ? void startServer(memoryConfirmationRequired) : void installLlama('install', true)}>{memoryConfirmationRequired ? t('startAnyway') : managerStatus?.version ? t('startServer') : t('installAndStart')}</button>
@@ -1554,8 +1606,12 @@ function App() {
               </div> : null}
               {capabilities ? <div className="capability-list">
                 <span>{t('contextLength')} {capabilities.context_length?.toLocaleString() ?? t('unknown')}</span>
+                {managerStatus?.running ? <span>{t('activeContext')} {managerStatus.context_size?.toLocaleString() ?? t('unknown')}</span> : null}
                 <span>{t('tools')} {capabilities.tool_calling ? t('supported') : t('unknown')}</span>
                 <span>{t('vision')} {capabilities.vision ? t('supported') : t('notDetectedVision')}</span>
+              </div> : null}
+              {managerStatus?.running && managerStatus.context_size !== contextSize ? <div className="manager-button-row">
+                <button type="button" className="manager-button primary" disabled={busy} onClick={() => void restartServerWithSelectedContext(memoryConfirmationRequired)}>{memoryConfirmationRequired ? t('startAnyway') : t('applyContext')}</button>
               </div> : null}
               {error ? <div className="status-error">{error}</div> : null}
               {serverLogs.length > 0 ? <pre className="server-log" aria-label={t('serverLog')}>{serverLogs.join('\n')}</pre> : null}

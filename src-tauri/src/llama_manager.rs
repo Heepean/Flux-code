@@ -22,6 +22,7 @@ const SERVER_LOG_EVENT: &str = "llama-server-log";
 pub struct RuntimeState {
     child: Mutex<Option<Child>>,
     port: Mutex<Option<u16>>,
+    context_size: Mutex<Option<u32>>,
 }
 
 #[derive(Serialize)]
@@ -31,6 +32,7 @@ pub struct ManagerStatus {
     pub version: Option<String>,
     pub running: bool,
     pub port: Option<u16>,
+    pub context_size: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -171,6 +173,9 @@ pub fn get_llama_manager_status(
                 if let Ok(mut port) = state.port.lock() {
                     *port = None;
                 }
+                if let Ok(mut context_size) = state.context_size.lock() {
+                    *context_size = None;
+                }
                 false
             }
             Ok(None) => true,
@@ -183,6 +188,14 @@ pub fn get_llama_manager_status(
     } else {
         None
     };
+    let context_size = if running {
+        *state
+            .context_size
+            .lock()
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
 
     Ok(ManagerStatus {
         install_dir: install_dir.to_string_lossy().to_string(),
@@ -190,6 +203,7 @@ pub fn get_llama_manager_status(
         version,
         running,
         port,
+        context_size,
     })
 }
 
@@ -411,6 +425,7 @@ fn get_status_without_state(app: &AppHandle) -> Result<ManagerStatus, String> {
         version,
         running: false,
         port: None,
+        context_size: None,
     })
 }
 
@@ -502,6 +517,9 @@ pub fn estimate_model_memory(
         .map_err(|error| error.to_string())?
         .len();
     let profile = get_machine_profile();
+    // Approximate the K/V cache at about 128 KiB per token for a typical
+    // llama.cpp transformer. This scales with the requested context so large
+    // 256K/512K settings trigger the existing memory warning appropriately.
     let kv_cache_bytes = u64::from(context_size).saturating_mul(128 * 1024);
     // Include runtime overhead (graph/work buffers and allocator slack) so a borderline estimate does not page the OS.
     let estimated_total_bytes = model_bytes
@@ -556,8 +574,8 @@ pub async fn start_llama_server(
     {
         return Err("Select an existing GGUF model file".to_string());
     }
-    if !(512..=65_536).contains(&context_size) {
-        return Err("Context size must be between 512 and 65536 tokens".to_string());
+    if !(512..=524_288).contains(&context_size) {
+        return Err("Context size must be between 512 and 524288 tokens".to_string());
     }
     if gpu_layers > 99 {
         return Err("GPU layer count cannot exceed 99".to_string());
@@ -602,6 +620,10 @@ pub async fn start_llama_server(
     }
     *state.child.lock().map_err(|error| error.to_string())? = Some(process);
     *state.port.lock().map_err(|error| error.to_string())? = Some(port);
+    *state
+        .context_size
+        .lock()
+        .map_err(|error| error.to_string())? = Some(context_size);
 
     let health_url = format!("http://127.0.0.1:{port}/health");
     let client = reqwest::Client::builder()
@@ -627,6 +649,10 @@ pub async fn start_llama_server(
                 {
                     *child = None;
                     *state.port.lock().map_err(|error| error.to_string())? = None;
+                    *state
+                        .context_size
+                        .lock()
+                        .map_err(|error| error.to_string())? = None;
                     true
                 } else {
                     false
@@ -651,6 +677,10 @@ fn stop_runtime(state: &RuntimeState) -> Result<(), String> {
         let _ = process.wait();
     }
     *state.port.lock().map_err(|error| error.to_string())? = None;
+    *state
+        .context_size
+        .lock()
+        .map_err(|error| error.to_string())? = None;
     Ok(())
 }
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.1
+
+- Show the actual context size used by the running local model server.
+- Add an explicit restart action so a newly selected context is applied to llama.cpp.
+- Compact chat history using the active server context and a more conservative multilingual token estimate.
+- Keep the selected context available up to 512K, subject to model support and available memory.
+
 ## v0.2.0
 
 - Improved LSP setup for TypeScript/JavaScript, Python, Rust, Go, JSON, HTML, and CSS.
