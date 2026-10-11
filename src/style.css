@@ -63,3 +63,16 @@
  .android-app .kilo-model{min-height:48px}
  .android-app .models-view,.android-app .agent-view{overscroll-behavior:contain}
 }
+
+.workspace-search-view{height:100%;overflow:auto;padding:36px 42px;color:var(--text);background:var(--surface)}
+.workspace-search-form{display:flex;gap:10px;max-width:900px;margin:24px 0 18px}
+.workspace-search-form input{flex:1;min-width:0;height:42px;border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:0 13px;color:var(--text);font:13px 'DM Sans',sans-serif;outline:none}
+.workspace-search-form input:focus{border-color:var(--accent)}
+.workspace-search-form .primary-button{min-width:100px}
+.workspace-search-results{display:flex;flex-direction:column;gap:5px;max-width:1100px}
+.workspace-search-result{display:grid;grid-template-columns:minmax(160px,320px) 45px 1fr;align-items:center;gap:8px;width:100%;min-height:38px;padding:7px 10px;text-align:left;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--muted);cursor:pointer}
+.workspace-search-result:hover{border-color:var(--line);background:var(--panel)}
+.search-result-path{overflow:hidden;color:var(--accent);text-overflow:ellipsis;white-space:nowrap;font:11px 'Cascadia Code',monospace}
+.search-result-line{color:var(--muted);font:11px 'Cascadia Code',monospace}
+.workspace-search-result code{overflow:hidden;color:var(--text);text-overflow:ellipsis;white-space:nowrap;font:12px 'Cascadia Code',monospace}
+.empty-search{padding:20px;color:var(--muted);font-size:13px}

@@ -38,6 +38,54 @@ struct Entry {
     is_dir: bool,
 }
 
+#[derive(Serialize)]
+struct SearchResult {
+    path: String,
+    line: usize,
+    preview: String,
+}
+
+fn ignored_search_directory(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".venv"
+            | "venv"
+            | "vendor"
+            | ".next"
+            | ".cache"
+    )
+}
+
+fn matching_lines(text: &str, query: &str, path: &str, limit: usize) -> Vec<SearchResult> {
+    let needle = query.to_lowercase();
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if line.to_lowercase().contains(&needle) {
+                let line = line.trim();
+                let preview = if line.chars().count() > 500 {
+                    format!("{}…", line.chars().take(499).collect::<String>())
+                } else {
+                    line.to_owned()
+                };
+                Some(SearchResult {
+                    path: path.to_owned(),
+                    line: index + 1,
+                    preview,
+                })
+            } else {
+                None
+            }
+        })
+        .take(limit)
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct StartModel {
     model_path: String,
@@ -283,6 +331,74 @@ fn list_directory(path: String) -> Result<Vec<Entry>, String> {
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(out)
+}
+
+#[tauri::command]
+fn search_workspace(path: String, query: String) -> Result<Vec<SearchResult>, String> {
+    let query = query.trim();
+    if query.is_empty() || query.chars().count() > 256 {
+        return Err("Введите поисковый текст длиной до 256 символов".into());
+    }
+    search_workspace_files(Path::new(&path), query)
+}
+
+fn search_workspace_files(path: &Path, query: &str) -> Result<Vec<SearchResult>, String> {
+    let root =
+        fs::canonicalize(path).map_err(|error| format!("Не удалось открыть проект: {error}"))?;
+    if !root.is_dir() {
+        return Err("Папка проекта недоступна".into());
+    }
+    let mut directories = vec![(root.clone(), 0usize)];
+    let mut results = Vec::new();
+    let mut visited_files = 0usize;
+    while let Some((directory, depth)) = directories.pop() {
+        if depth > 24 || results.len() >= 300 || visited_files >= 15_000 {
+            break;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for item in entries.flatten() {
+            if results.len() >= 300 || visited_files >= 15_000 {
+                break;
+            }
+            let item_path = item.path();
+            let file_type = match item.file_type() {
+                Ok(file_type) if !file_type.is_symlink() => file_type,
+                _ => continue,
+            };
+            if file_type.is_dir() {
+                if !ignored_search_directory(&item.file_name().to_string_lossy()) {
+                    directories.push((item_path, depth + 1));
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            visited_files += 1;
+            let metadata = match item.metadata() {
+                Ok(metadata) if metadata.len() <= 2 * 1024 * 1024 => metadata,
+                _ => continue,
+            };
+            if metadata.len() == 0 {
+                continue;
+            }
+            let bytes = match fs::read(&item_path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            let absolute_path = item_path.to_string_lossy().into_owned();
+            let mut matches = matching_lines(text, query, &absolute_path, 300 - results.len());
+            results.append(&mut matches);
+        }
+    }
+    Ok(results)
 }
 
 #[tauri::command]
@@ -641,6 +757,7 @@ pub fn run() {
             path_is_file,
             install_llama_runtime,
             scan_models,
+            search_workspace,
             read_text_file,
             write_text_file,
             start_local_model,
@@ -680,4 +797,61 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod workspace_search_tests {
+    use super::{
+        ignored_search_directory, matching_lines, search_workspace, search_workspace_files,
+    };
+    use std::fs;
+
+    #[test]
+    fn search_matches_case_insensitively_and_keeps_line_numbers() {
+        let results = matching_lines(
+            "first line\nNeedle here\nneedle again",
+            "NEEDLE",
+            "src/lib.rs",
+            10,
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].line, 2);
+        assert_eq!(results[0].path, "src/lib.rs");
+        assert_eq!(results[0].preview, "Needle here");
+        assert_eq!(results[1].line, 3);
+    }
+
+    #[test]
+    fn search_caps_results_and_ignores_dependency_and_build_directories() {
+        let results = matching_lines("match\nmatch\nmatch", "match", "file.txt", 2);
+        assert_eq!(results.len(), 2);
+        assert!(ignored_search_directory("node_modules"));
+        assert!(ignored_search_directory(".GIT"));
+        assert!(!ignored_search_directory("src"));
+    }
+
+    #[test]
+    fn workspace_search_walks_source_files_and_skips_dependency_folders() {
+        let root = std::env::temp_dir().join(format!("flux-hands-search-{}", uuid::Uuid::new_v4()));
+        let source = root.join("src");
+        let dependencies = root.join("node_modules").join("package");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dependencies).unwrap();
+        fs::write(source.join("main.rs"), "first\nTarget Phrase\nlast").unwrap();
+        fs::write(dependencies.join("ignored.js"), "target phrase").unwrap();
+
+        let results = search_workspace_files(&root, "target phrase").unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].path.ends_with("main.rs"));
+        assert_eq!(results[0].line, 2);
+        assert_eq!(results[0].preview, "Target Phrase");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_search_rejects_empty_and_excessive_queries() {
+        assert!(search_workspace("missing-project".into(), "  ".into()).is_err());
+        assert!(search_workspace("missing-project".into(), "x".repeat(257)).is_err());
+    }
 }
