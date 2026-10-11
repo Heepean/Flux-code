@@ -42,20 +42,22 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          if ($env:RELEASE_TAG -ne "v$($config.version)") { throw "Tag $($env:RELEASE_TAG) does not match version $($config.version)." }
-          $source = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          $version = [string]$config.version
+          if ($env:RELEASE_TAG -ne ('v' + $version)) { throw "Tag $($env:RELEASE_TAG) does not match version $version." }
+          $source = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' | Select-Object -First 1
           if (-not $source) { throw 'NSIS installer was not generated.' }
           $sourceSig = "$($source.FullName).sig"
           if (-not (Test-Path $sourceSig)) { throw 'Tauri updater signature is missing.' }
-          $assetName = "Flux.Hands_$($config.version)_x64-setup.exe"
+          $assetName = "Flux.Hands_${version}_x64-setup.exe"
           $installer = Join-Path $env:RUNNER_TEMP $assetName
           $signature = "$installer.sig"
           Copy-Item $source.FullName $installer
           Copy-Item $sourceSig $signature
           $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG"
           $manifest = @{
-            version = $config.version
+            version = $version
             notes = 'Flux Hands — локальная AI-среда разработки'
             pub_date = (Get-Date).ToUniversalTime().ToString('o')
             platforms = @{
@@ -66,7 +68,8 @@ jobs:
             }
           } | ConvertTo-Json -Depth 6
           $manifestPath = Join-Path $env:RUNNER_TEMP 'latest.json'
-          Set-Content -Path $manifestPath -Value $manifest -Encoding utf8
+          [System.IO.File]::WriteAllText($manifestPath, $manifest, [System.Text.UTF8Encoding]::new($false))
+          if (-not (Test-Path $installer) -or -not (Test-Path $signature) -or -not (Test-Path $manifestPath)) { throw 'Release assets were not prepared.' }
           "installer=$installer" >> $env:GITHUB_OUTPUT
           "signature=$signature" >> $env:GITHUB_OUTPUT
           "manifest=$manifestPath" >> $env:GITHUB_OUTPUT
