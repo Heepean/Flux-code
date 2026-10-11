@@ -1,12 +1,9 @@
-name: Release Windows app
+name: Flux Hands Windows release
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Release tag, for example v0.1.0
-        required: true
-        type: string
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -16,8 +13,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -27,47 +22,41 @@ jobs:
         with:
           workspaces: src-tauri -> target
       - run: npm ci
-      - name: Check signing secrets
+      - name: Verify updater signing secrets
         shell: pwsh
         env:
-          UPDATER_PUBLIC_KEY: ${{ secrets.UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          if (-not $env:UPDATER_PUBLIC_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
-            throw 'Configure UPDATER_PUBLIC_KEY, TAURI_SIGNING_PRIVATE_KEY, and TAURI_SIGNING_PRIVATE_KEY_PASSWORD repository secrets first.'
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+            throw 'Set TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD in repository Actions secrets.'
           }
-      - name: Build signed updater bundle
-        run: npm run tauri build
+      - name: Build signed Windows installers
+        run: npm run build:desktop
         env:
-          UPDATER_PUBLIC_KEY: ${{ secrets.UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      - name: Validate release version and prepare assets
+      - name: Prepare signed updater manifest
         id: assets
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          $expectedTag = "v$($config.version)"
-          if ($env:RELEASE_TAG -ne $expectedTag) {
-            throw "Release tag $($env:RELEASE_TAG) does not match app version $($config.version) (expected $expectedTag)."
-          }
-          $sourceInstaller = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
-          if (-not $sourceInstaller) { throw 'NSIS installer was not generated.' }
-          $sourceSignature = "$($sourceInstaller.FullName).sig"
-          if (-not (Test-Path $sourceSignature)) { throw 'Updater signature was not generated. Check signing secrets.' }
-          $assetName = "Flux.Code_$($config.version)_x64-setup.exe"
+          if ($env:RELEASE_TAG -ne "v$($config.version)") { throw "Tag $($env:RELEASE_TAG) does not match version $($config.version)." }
+          $source = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $source) { throw 'NSIS installer was not generated.' }
+          $sourceSig = "$($source.FullName).sig"
+          if (-not (Test-Path $sourceSig)) { throw 'Tauri updater signature is missing.' }
+          $assetName = "Flux.Hands_$($config.version)_x64-setup.exe"
           $installer = Join-Path $env:RUNNER_TEMP $assetName
           $signature = "$installer.sig"
-          Copy-Item $sourceInstaller.FullName $installer
-          Copy-Item $sourceSignature $signature
-          if (-not (Test-Path $signature)) { throw 'Updater signature asset was not prepared.' }
+          Copy-Item $source.FullName $installer
+          Copy-Item $sourceSig $signature
           $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG"
           $manifest = @{
             version = $config.version
-            notes = "Flux Code $($config.version)"
+            notes = 'Flux Hands — локальная AI-среда разработки'
             pub_date = (Get-Date).ToUniversalTime().ToString('o')
             platforms = @{
               'windows-x86_64' = @{
@@ -81,12 +70,14 @@ jobs:
           "installer=$installer" >> $env:GITHUB_OUTPUT
           "signature=$signature" >> $env:GITHUB_OUTPUT
           "manifest=$manifestPath" >> $env:GITHUB_OUTPUT
-          Write-Host "Prepared signed release assets for $($config.version)."
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}
-          generate_release_notes: true
+          tag_name: ${{ github.ref_name }}
+          name: Flux Hands ${{ github.ref_name }}
+          generate_release_notes: false
+          body_path: .github/release-notes/${{ github.ref_name }}.md
           files: |
             ${{ steps.assets.outputs.installer }}
             ${{ steps.assets.outputs.signature }}
             ${{ steps.assets.outputs.manifest }}
+            src-tauri/target/release/bundle/msi/*.msi

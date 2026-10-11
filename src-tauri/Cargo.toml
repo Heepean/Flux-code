@@ -1,40 +1,26 @@
 [package]
-name = "app"
-version = "0.2.1"
-description = "Local AI coding workspace with an integrated editor and agent"
-authors = ["Heepean"]
-license = "MIT"
-repository = "https://github.com/Heepean/flux-code"
-edition = "2024"
-rust-version = "1.90"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+name = "flux-hands"
+version = "1.0.0"
+description = "Local-first AI development studio"
+authors = ["Flux Code"]
+edition = "2021"
 
 [lib]
-name = "app_lib"
+name = "flux_hands_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.7.1", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-log = "0.4"
-tauri = { version = "2.12.1", features = [] }
-tauri-plugin-log = "2"
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["process", "fs", "io-util", "time"] }
 futures-util = "0.3"
-keyring = { version = "3", features = ["windows-native"] }
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
-sysinfo = "0.33"
-tokio = { version = "1", features = ["fs", "io-util", "time"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
-tauri-plugin-dialog = "2.8.1"
-tauri-plugin-opener = "2.7.0"
-printpdf = { version = "0.12.8", default-features = false }
-portable-pty = "0.9.0"
+rfd = "0.15"
 uuid = { version = "1", features = ["v4"] }
-quick-xml = "0.40"
-pdf-extract = "0.12"
-tauri-plugin-updater = "2"
-tauri-plugin-process = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tauri-plugin-updater = "2.13.3"
+tauri-plugin-process = "2.4.0"

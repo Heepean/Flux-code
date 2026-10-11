@@ -1,15 +1,3 @@
-import react from '@vitejs/plugin-react'
-import { defineConfig } from 'vite'
-import { readFileSync } from 'node:fs'
-
-const packageVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
-const updaterConfigured = Boolean(process.env.UPDATER_PUBLIC_KEY?.trim())
-
-// https://vite.dev/config/
-export default defineConfig({
-  plugins: [react()],
-  define: {
-    'import.meta.env.PACKAGE_VERSION': JSON.stringify(packageVersion),
-    'import.meta.env.UPDATER_CONFIGURED': JSON.stringify(updaterConfigured),
-  },
-})
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins:[react()], clearScreen:false, server:{host:'127.0.0.1',port:1420,strictPort:true,watch:{ignored:['**/src-tauri/target/**']}}, envPrefix:['VITE_','TAURI_'], build:{target:process.env.TAURI_ENV_PLATFORM==='windows'?'chrome105':'safari13'} });

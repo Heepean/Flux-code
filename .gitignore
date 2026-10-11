@@ -1,30 +1,9 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-
-# Build outputs and signing material
+node_modules/
+dist/
 src-tauri/target/
-src-tauri/*.key
-src-tauri/*.key.pub
-*.sig
+src-tauri/.tauri/
+*.log
+*.tmp
+OpenHands-1.26.0.zip
+vscode-1.141.0.zip
+electron/
