@@ -1,9 +1,11 @@
 [package]
 name = "flux-hands"
-version = "1.0.5"
+version = "1.0.7"
 description = "Local-first AI development studio"
 authors = ["Flux Code"]
 edition = "2021"
+
+[workspace]
 
 [lib]
 name = "flux_hands_lib"
@@ -16,6 +18,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio = { version = "1", features = ["process", "fs", "io-util", "time", "sync"] }
 futures-util = "0.3"
@@ -25,3 +28,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 tauri-plugin-updater = "2.13.3"
 tauri-plugin-process = "2.4.0"
 keyring = { version = "4.2.0", default-features = false, features = ["v1", "windows-native-keyring-store"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }

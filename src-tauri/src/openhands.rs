@@ -6,12 +6,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 const SERVER_VERSION: &str = "1.26.0";
+const KILO_GATEWAY_BASE: &str = "https://api.kilo.ai/api/gateway";
 const UV_RELEASE_API: &str = "https://api.github.com/repos/astral-sh/uv/releases/latest";
 const UV_WINDOWS_ARCHIVE: &str = "uv-x86_64-pc-windows-msvc.zip";
 
@@ -20,7 +20,7 @@ pub struct AgentServerState {
     child: Mutex<Option<Child>>,
     port: Mutex<Option<u16>>,
     session_key: Mutex<Option<String>>,
-    config: Mutex<Option<(String, String, String, String)>>,
+    config: Mutex<Option<(String, String, String, String, String)>>,
     log: Arc<Mutex<String>>,
 }
 
@@ -240,17 +240,79 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
-fn take_sse_lines(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
-    pending.extend_from_slice(chunk);
-    let mut lines = Vec::new();
-    while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
-        lines.push(
-            String::from_utf8_lossy(&pending.drain(..=end).collect::<Vec<_>>())
-                .trim()
-                .to_string(),
-        );
-    }
-    lines
+fn kilo_model_is_free_text(model: &serde_json::Value) -> bool {
+    let zero_price = |value: Option<&serde_json::Value>| {
+        value.is_some_and(|value| match value {
+            serde_json::Value::Number(number) => number.as_f64() == Some(0.0),
+            serde_json::Value::String(price) => price.parse::<f64>().ok() == Some(0.0),
+            _ => false,
+        })
+    };
+    let is_free = model.get("isFree").and_then(serde_json::Value::as_bool) == Some(true)
+        || (zero_price(model.pointer("/pricing/prompt"))
+            && zero_price(model.pointer("/pricing/completion")));
+    let supports_text = model
+        .pointer("/architecture/input_modalities")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("text")))
+        && model
+            .pointer("/architecture/output_modalities")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("text")));
+    is_free && supports_text && model.get("id").is_some()
+}
+
+#[tauri::command]
+pub async fn fetch_kilo_free_models() -> Result<Vec<serde_json::Value>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("Flux-Hands/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(format!("{KILO_GATEWAY_BASE}/models"))
+        .send()
+        .await
+        .map_err(|error| format!("Не удалось получить каталог Kilo: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Kilo Gateway отклонил запрос каталога: {error}"))?;
+    let catalog: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Kilo вернул некорректный каталог: {error}"))?;
+    let models = catalog
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| catalog.as_array())
+        .ok_or_else(|| "Формат каталога Kilo не содержит список моделей".to_string())?;
+    let mut free_models = models
+        .iter()
+        .filter(|model| kilo_model_is_free_text(model))
+        .map(|model| {
+            serde_json::json!({
+                "id": model.get("id"),
+                "name": model.get("name").and_then(serde_json::Value::as_str).unwrap_or_else(|| model.get("id").and_then(serde_json::Value::as_str).unwrap_or("Kilo model")),
+                "description": model.get("description").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                "contextLength": model.get("context_length").or_else(|| model.pointer("/top_provider/context_length")),
+                "mayTrainOnYourPrompts": model.get("mayTrainOnYourPrompts").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                "supportsTools": model.get("supported_parameters").and_then(serde_json::Value::as_array).is_some_and(|items| items.iter().any(|item| item.as_str() == Some("tools")))
+            })
+        })
+        .collect::<Vec<_>>();
+    free_models.sort_by(|a, b| {
+        a.get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase()
+            .cmp(
+                &b.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_lowercase(),
+            )
+    });
+    Ok(free_models)
 }
 
 #[tauri::command]
@@ -278,16 +340,22 @@ pub async fn start_agent_server(
         return Err("Сначала выберите модель".into());
     }
     let provider = provider.trim().to_ascii_lowercase();
-    if provider != "local" && provider != "remote" {
-        return Err("Выберите локальную модель или OpenAI-compatible endpoint".into());
+    if provider != "local" && provider != "remote" && provider != "kilo" {
+        return Err("Выберите локальную модель, Kilo Free или OpenAI-compatible endpoint".into());
     }
     let endpoint = if provider == "local" {
         "http://127.0.0.1:8080/v1".to_string()
+    } else if provider == "kilo" {
+        KILO_GATEWAY_BASE.to_string()
     } else {
         normalize_endpoint(&endpoint)?
     };
     let api_key = if provider == "local" {
         "local".to_string()
+    } else if provider == "kilo" {
+        // LiteLLM rejects an empty credential before it sends the anonymous
+        // request. Kilo accepts an arbitrary bearer value for its free models.
+        "anonymous".to_string()
     } else {
         remote_key_entry()
             .ok()
@@ -319,6 +387,7 @@ pub async fn start_agent_server(
         provider.clone(),
         endpoint.clone(),
         model.to_owned(),
+        api_key.clone(),
     );
     {
         let mut child = state.child.lock().map_err(|error| error.to_string())?;
@@ -382,6 +451,7 @@ pub async fn start_agent_server(
         .env("PYTHONUTF8", "1")
         .env("DO_NOT_TRACK", "1")
         .env("VITE_DO_NOT_TRACK", "1")
+        .env("OH_LOG_LEVEL", "INFO")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -446,33 +516,6 @@ pub async fn start_agent_server(
             .await
         {
             if response.status().is_success() {
-                let profile = serde_json::json!({
-                    "llm": {
-                        "model": &model_id,
-                        "api_key": &api_key,
-                        "base_url": &endpoint
-                    },
-                    "include_secrets": true
-                });
-                let profile_url = format!("http://127.0.0.1:{port}/api/profiles/flux_hands");
-                let _ = client
-                    .delete(&profile_url)
-                    .header("X-Session-API-Key", &session_key)
-                    .send()
-                    .await;
-                let response = client
-                    .post(profile_url)
-                    .header("X-Session-API-Key", &session_key)
-                    .json(&profile)
-                    .send()
-                    .await
-                    .map_err(|error| format!("Не удалось настроить модель OpenHands: {error}"))?;
-                if !response.status().is_success() && response.status().as_u16() != 409 {
-                    let details = response.text().await.unwrap_or_default();
-                    return Err(format!(
-                        "OpenHands не принял конфигурацию локальной модели: {details}"
-                    ));
-                }
                 *state.config.lock().map_err(|error| error.to_string())? = Some(config.clone());
                 return Ok(status(&state));
             }
@@ -511,7 +554,7 @@ pub async fn send_agent_message(
     message: String,
     conversation_id: Option<String>,
 ) -> Result<String, String> {
-    let (port, key) = {
+    let (port, key, config) = {
         let port = state
             .port
             .lock()
@@ -523,171 +566,390 @@ pub async fn send_agent_message(
             .map_err(|error| error.to_string())?
             .clone()
             .ok_or("OpenHands session key is missing")?;
-        (port, key)
+        let config = state
+            .config
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone()
+            .ok_or("OpenHands model configuration is missing")?;
+        (port, key, config)
     };
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-    let mut request = reqwest::Client::new()
-        .post(url)
-        .bearer_auth(&key)
-        .json(&serde_json::json!({
-            "model": "openhands_flux_hands",
-            "stream": true,
-            "messages": [{"role":"user", "content":message}]
-        }));
+    let (workspace, provider, endpoint, model, api_key) = config;
+    let model_id = if provider == "local" {
+        "openai/local-model".to_string()
+    } else {
+        format!("openai/{model}")
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let base = format!("http://127.0.0.1:{port}/api/conversations");
+    let headers = [("X-Session-API-Key", key)];
+    let mut conversation_id = conversation_id;
     if let Some(id) = conversation_id.as_deref() {
-        request = request.header("X-OpenHands-ServerConversation-ID", id);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("Не удалось отправить задачу OpenHands: {error}"))?;
-    if !response.status().is_success() {
-        let details = response.text().await.unwrap_or_default();
-        let _ = app.emit(
-            "openhands-agent-event",
-            AgentEvent {
-                delta: String::new(),
-                done: true,
-                conversation_id: None,
-                error: Some(details.clone()),
-            },
-        );
-        return Err(format!("OpenHands Agent Server отклонил задачу: {details}"));
-    }
-    let conversation_id = response
-        .headers()
-        .get("X-OpenHands-ServerConversation-ID")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or(conversation_id);
-    let mut stream = response.bytes_stream();
-    // Keep raw bytes until a complete SSE line is available. Converting each
-    // network chunk separately can corrupt UTF-8 characters split between
-    // chunks (especially Russian text).
-    let mut pending = Vec::new();
-    let mut answer = String::new();
-    let mut announced_tool_calls = std::collections::HashSet::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("Поток OpenHands прерван: {error}"))?;
-        for line in take_sse_lines(&mut pending, &chunk) {
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim();
-            if data == "[DONE]" {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
-            if let Some(delta) = value
-                .pointer("/choices/0/delta/content")
-                .and_then(|value| value.as_str())
-            {
-                if !delta.is_empty() {
-                    answer.push_str(delta);
-                    let _ = app.emit(
-                        "openhands-agent-event",
-                        AgentEvent {
-                            delta: delta.to_owned(),
-                            done: false,
-                            conversation_id: conversation_id.clone(),
-                            error: None,
-                        },
-                    );
-                }
-            }
-            // OpenHands can spend an entire response invoking tools without
-            // producing ordinary assistant text. Surface those calls in the
-            // same live stream so the UI does not look frozen.
-            if let Some(tool_calls) = value
-                .pointer("/choices/0/delta/tool_calls")
-                .and_then(serde_json::Value::as_array)
-            {
-                for tool_call in tool_calls {
-                    let index = tool_call.get("index").and_then(serde_json::Value::as_u64);
-                    let name = tool_call
-                        .pointer("/function/name")
-                        .and_then(serde_json::Value::as_str);
-                    if let (Some(index), Some(name)) = (index, name) {
-                        if announced_tool_calls.insert(index) {
-                            let activity = format!("\n\n[OpenHands] Запускает инструмент: {name}");
-                            answer.push_str(&activity);
-                            let _ = app.emit(
-                                "openhands-agent-event",
-                                AgentEvent {
-                                    delta: activity,
-                                    done: false,
-                                    conversation_id: conversation_id.clone(),
-                                    error: None,
-                                },
-                            );
-                        }
+        let conversation = client
+            .get(format!("{base}/{id}"))
+            .header(headers[0].0, &headers[0].1)
+            .send()
+            .await
+            .map_err(|error| format!("Не удалось открыть разговор OpenHands: {error}"))?;
+        if conversation.status().as_u16() == 404 {
+            conversation_id = None;
+        } else if !conversation.status().is_success() {
+            let details = conversation.text().await.unwrap_or_default();
+            return Err(format!("OpenHands не открыл разговор: {details}"));
+        } else {
+            let switched = client
+                .post(format!("{base}/{id}/switch_llm"))
+                .header(headers[0].0, &headers[0].1)
+                .json(&serde_json::json!({
+                    "llm": {
+                        "model": model_id,
+                        "api_key": api_key,
+                        "base_url": endpoint,
+                        "reasoning_effort": "high"
                     }
-                }
-            }
+                }))
+                .send()
+                .await
+                .map_err(|error| format!("Не удалось переключить модель разговора: {error}"))?;
+            ensure_success(switched, "OpenHands не переключил модель разговора").await?;
         }
     }
-    if !pending.is_empty() {
-        let line = String::from_utf8_lossy(&pending).trim().to_string();
-        if let Some(data) = line.strip_prefix("data:").map(str::trim) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(delta) = value
-                    .pointer("/choices/0/delta/content")
+    let (id, mut seen) = if let Some(id) = conversation_id {
+        let existing = client
+            .get(format!(
+                "{base}/{id}/events/search?limit=1&sort_order=TIMESTAMP_DESC"
+            ))
+            .header(headers[0].0, &headers[0].1)
+            .send()
+            .await
+            .map_err(|error| format!("Не удалось проверить историю OpenHands: {error}"))?;
+        let existing = ensure_success_json(existing, "OpenHands не вернул историю").await?;
+        let last = existing
+            .pointer("/items/0/id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let response = client
+            .post(format!("{base}/{id}/events"))
+            .header(headers[0].0, &headers[0].1)
+            .json(&serde_json::json!({
+                "role": "user",
+                "content": [{"type":"text", "text":message}],
+                "run": true
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("Не удалось добавить задачу в OpenHands: {error}"))?;
+        ensure_success(response, "OpenHands не принял задачу").await?;
+        (
+            id,
+            last.into_iter().collect::<std::collections::HashSet<_>>(),
+        )
+    } else {
+        let response = client
+            .post(&base)
+            .header(headers[0].0, &headers[0].1)
+            .json(&serde_json::json!({
+                "workspace": {"working_dir": workspace, "kind": "LocalWorkspace"},
+                "agent": {
+                    "kind": "Agent",
+                    "llm": {"model": model_id, "api_key": api_key, "base_url": endpoint, "reasoning_effort": "high"},
+                    "tools": [
+                        {"name":"terminal","params":{}},
+                        {"name":"file_editor","params":{}},
+                        {"name":"task_tracker","params":{}},
+                        {"name":"task_tool_set","params":{}}
+                    ]
+                },
+                "confirmation_policy": {"kind":"NeverConfirm"},
+                "initial_message": {"role":"user", "content":[{"type":"text","text":message}], "run":true},
+                "autotitle": false
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("Не удалось создать разговор OpenHands: {error}"))?;
+        let value = ensure_success_json(response, "OpenHands не создал разговор").await?;
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OpenHands не вернул ID разговора")?
+            .to_owned();
+        let last_user_message = value
+            .get("last_user_message_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        (
+            id,
+            last_user_message
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+        )
+    };
+    let _ = app.emit(
+        "openhands-agent-event",
+        AgentEvent {
+            delta: String::new(),
+            done: false,
+            conversation_id: Some(id.clone()),
+            error: None,
+        },
+    );
+    let mut answer = String::new();
+    let mut final_status = String::new();
+    let mut assistant_messages = std::collections::HashSet::new();
+    for _ in 0..600 {
+        let mut new_events = Vec::new();
+        let mut page_id = None;
+        loop {
+            let mut url = format!("{base}/{id}/events/search?limit=100&sort_order=TIMESTAMP_DESC");
+            if let Some(page_id) = page_id.as_deref() {
+                url.push_str("&page_id=");
+                url.push_str(page_id);
+            }
+            let events = client
+                .get(url)
+                .header(headers[0].0, &headers[0].1)
+                .send()
+                .await
+                .map_err(|error| format!("Не удалось получить события OpenHands: {error}"))?;
+            let events = ensure_success_json(events, "OpenHands не вернул события").await?;
+            let items = events
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .ok_or("Формат событий OpenHands неизвестен")?;
+            let mut reached_seen_event = false;
+            for event in items {
+                let event_id = event
+                    .get("id")
                     .and_then(serde_json::Value::as_str)
-                {
-                    answer.push_str(delta);
+                    .unwrap_or_default();
+                if event_id.is_empty() || seen.contains(event_id) {
+                    reached_seen_event = true;
+                    break;
+                }
+                new_events.push(event.clone());
+            }
+            if reached_seen_event {
+                break;
+            }
+            page_id = events
+                .get("next_page_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if page_id.is_none() || items.is_empty() {
+                break;
+            }
+        }
+        new_events.reverse();
+        for event in &new_events {
+            let event_id = event
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if event_id.is_empty() || !seen.insert(event_id.to_owned()) {
+                continue;
+            }
+            let kind = event
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let source = event
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if kind == "MessageEvent"
+                && source == "agent"
+                && !assistant_messages.insert(event_id.to_owned())
+            {
+                continue;
+            }
+            let text = if kind == "MessageEvent" && source == "agent" {
+                event
+                    .pointer("/llm_message/content")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+            } else if kind == "StreamingDeltaEvent" && source == "agent" {
+                event
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                if !answer.ends_with(&text) {
+                    answer.push_str(&text);
                     let _ = app.emit(
                         "openhands-agent-event",
                         AgentEvent {
-                            delta: delta.to_owned(),
+                            delta: text,
                             done: false,
-                            conversation_id: conversation_id.clone(),
+                            conversation_id: Some(id.clone()),
                             error: None,
                         },
                     );
                 }
             }
+            if kind == "ActionEvent" {
+                let name = event
+                    .get("tool_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool");
+                let activity = format!("\n\n[OpenHands] Запускает инструмент: {name}\n");
+                answer.push_str(&activity);
+                let _ = app.emit(
+                    "openhands-agent-event",
+                    AgentEvent {
+                        delta: activity,
+                        done: false,
+                        conversation_id: Some(id.clone()),
+                        error: None,
+                    },
+                );
+            }
+            if kind == "ObservationEvent" {
+                let output = event
+                    .pointer("/observation/content")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if !output.is_empty() {
+                    let activity = format!("\n{output}\n");
+                    answer.push_str(&activity);
+                    let _ = app.emit(
+                        "openhands-agent-event",
+                        AgentEvent {
+                            delta: activity,
+                            done: false,
+                            conversation_id: Some(id.clone()),
+                            error: None,
+                        },
+                    );
+                }
+            }
+            if kind == "ConversationStateUpdateEvent" {
+                let key = event.get("key").and_then(serde_json::Value::as_str);
+                if key == Some("execution_status") {
+                    final_status = event
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                } else if key == Some("full_state") {
+                    final_status = event
+                        .pointer("/value/execution_status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                }
+            }
+            if kind == "ConversationErrorEvent"
+                || kind == "AgentErrorEvent"
+                || kind == "ServerErrorEvent"
+            {
+                let details = event
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| event.get("message").and_then(serde_json::Value::as_str))
+                    .or_else(|| event.get("detail").and_then(serde_json::Value::as_str))
+                    .unwrap_or("OpenHands agent error");
+                return Err(details.to_owned());
+            }
         }
+        if ["idle", "finished", "paused", "error"].contains(&final_status.as_str()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    if answer.trim().is_empty() && !announced_tool_calls.is_empty() {
-        answer = "OpenHands выполнил запрос через инструменты без отдельного текстового ответа. Проверьте изменения в проекте.".into();
+    if final_status.is_empty() || final_status == "running" {
+        return Err("Превышено время ожидания выполнения задачи OpenHands".into());
     }
     let _ = app.emit(
         "openhands-agent-event",
         AgentEvent {
             delta: String::new(),
             done: true,
-            conversation_id,
+            conversation_id: Some(id),
             error: None,
         },
     );
     if answer.trim().is_empty() {
-        return Err("OpenHands завершил задачу без текстового ответа".into());
+        return Err(format!(
+            "OpenHands завершил задачу со статусом {final_status} без текстового ответа"
+        ));
     }
     Ok(answer)
 }
 
+async fn ensure_success(response: reqwest::Response, context: &str) -> Result<(), String> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{context}: {}",
+        response.text().await.unwrap_or_default()
+    ))
+}
+
+async fn ensure_success_json(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<serde_json::Value, String> {
+    if response.status().is_success() {
+        return response
+            .json()
+            .await
+            .map_err(|error| format!("{context}: {error}"));
+    }
+    Err(format!(
+        "{context}: {}",
+        response.text().await.unwrap_or_default()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::take_sse_lines;
+    use super::kilo_model_is_free_text;
 
     #[test]
-    fn sse_parser_preserves_utf8_split_between_network_chunks() {
-        let bytes = "data: {\"choices\":[{\"delta\":{\"content\":\"Привет\"}}]}\n".as_bytes();
-        let split = bytes
-            .iter()
-            .enumerate()
-            .find_map(|(index, byte)| (*byte & 0b1100_0000 == 0b1000_0000).then_some(index))
-            .expect("Russian text contains a UTF-8 continuation byte");
-        let mut pending = Vec::new();
-        assert!(take_sse_lines(&mut pending, &bytes[..split]).is_empty());
-        let lines = take_sse_lines(&mut pending, &bytes[split..]);
-        assert_eq!(
-            lines,
-            ["data: {\"choices\":[{\"delta\":{\"content\":\"Привет\"}}]}".to_string()]
-        );
-        assert!(pending.is_empty());
+    fn kilo_catalog_keeps_free_text_models_including_chat_only_models() {
+        let eligible = serde_json::json!({
+            "id": "provider/model:free",
+            "isFree": true,
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+            "supported_parameters": ["tools"]
+        });
+        assert!(kilo_model_is_free_text(&eligible));
+
+        let paid = serde_json::json!({
+            "id": "provider/paid",
+            "pricing": {"prompt": "0.0001", "completion": "0.0002"},
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+            "supported_parameters": ["tools"]
+        });
+        assert!(!kilo_model_is_free_text(&paid));
+
+        let no_tools = serde_json::json!({
+            "id": "provider/no-tools:free",
+            "isFree": true,
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+            "supported_parameters": ["temperature"]
+        });
+        assert!(kilo_model_is_free_text(&no_tools));
     }
 }
 

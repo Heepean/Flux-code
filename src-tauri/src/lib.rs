@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ struct LlamaRelease {
 struct LlamaAsset {
     name: String,
     browser_download_url: String,
+    digest: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +44,21 @@ struct StartModel {
     executable: String,
     context: Option<u32>,
     gpu_layers: Option<i32>,
+}
+
+#[cfg(windows)]
+fn available_physical_memory() -> Result<u64, String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut memory = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GlobalMemoryStatusEx(&mut memory) } == 0 {
+        return Err("Windows не смог определить доступную оперативную память".into());
+    }
+    Ok(memory.ullAvailPhys)
 }
 
 #[tauri::command]
@@ -105,24 +122,35 @@ async fn install_llama_runtime(
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|error| error.to_string())?;
-    let release: LlamaRelease = client
-        .get("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest")
+    let releases: Vec<LlamaRelease> = client
+        .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30")
         .send()
         .await
-        .map_err(|error| format!("Не удалось проверить релиз llama.cpp: {error}"))?
+        .map_err(|error| format!("Не удалось проверить релизы llama.cpp: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("GitHub отклонил запрос llama.cpp: {error}"))?
+        .map_err(|error| format!("GitHub отклонил запрос релизов llama.cpp: {error}"))?
         .json()
         .await
-        .map_err(|error| format!("Некорректный ответ релиза llama.cpp: {error}"))?;
-    let release_tag = release.tag_name;
-    let asset = release
-        .assets
+        .map_err(|error| format!("Некорректный список релизов llama.cpp: {error}"))?;
+    let (release_tag, asset) = releases
         .into_iter()
-        .find(|asset| {
-            asset.name.starts_with("llama-") && asset.name.ends_with("-bin-win-cpu-x64.zip")
+        .find_map(|release| {
+            release
+                .assets
+                .into_iter()
+                .find(|asset| {
+                    asset.name.starts_with("llama-") && asset.name.ends_with("-bin-win-cpu-x64.zip")
+                })
+                .map(|asset| (release.tag_name, asset))
         })
-        .ok_or_else(|| "В последнем релизе llama.cpp нет сборки Windows x64 CPU".to_string())?;
+        .ok_or_else(|| "В последних релизах llama.cpp нет сборки Windows x64 CPU".to_string())?;
+    let expected_digest = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .ok_or_else(|| {
+            "GitHub не предоставил SHA-256 для архива llama.cpp; загрузка отменена".to_string()
+        })?;
     let response = client
         .get(asset.browser_download_url)
         .send()
@@ -139,6 +167,10 @@ async fn install_llama_runtime(
         .map_err(|error| format!("Не удалось прочитать архив llama.cpp: {error}"))?;
     if bytes.len() < 1_000_000 || bytes.len() > 512 * 1024 * 1024 {
         return Err("Архив llama.cpp имеет недопустимый размер; загрузка отменена".into());
+    }
+    let actual_digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    if !actual_digest.eq_ignore_ascii_case(expected_digest) {
+        return Err("SHA-256 архива llama.cpp не совпадает с контрольной суммой GitHub".into());
     }
 
     fs::create_dir_all(&runtime_root).map_err(|error| error.to_string())?;
@@ -265,6 +297,22 @@ fn start_local_model(config: StartModel, state: State<Runtime>) -> Result<String
     }
     if !config.model_path.to_ascii_lowercase().ends_with(".gguf") {
         return Err("Поддерживаются только файлы модели GGUF".into());
+    }
+    #[cfg(windows)]
+    {
+        let model_bytes = fs::metadata(&config.model_path)
+            .map_err(|error| format!("Не удалось проверить размер модели: {error}"))?
+            .len();
+        let required_bytes = model_bytes.saturating_add(2 * 1024 * 1024 * 1024);
+        let available_bytes = available_physical_memory()?;
+        if available_bytes < required_bytes {
+            return Err(format!(
+                "Недостаточно свободной RAM для безопасного запуска модели. Модель занимает около {:.1} ГБ; требуется примерно {:.1} ГБ свободной RAM, сейчас доступно {:.1} ГБ. Закройте другие программы или выберите меньшую модель.",
+                model_bytes as f64 / 1024f64.powi(3),
+                required_bytes as f64 / 1024f64.powi(3),
+                available_bytes as f64 / 1024f64.powi(3)
+            ));
+        }
     }
     let context = config.context.unwrap_or(4096);
     if !(512..=131072).contains(&context) {
@@ -527,12 +575,27 @@ async fn wait_for_model(state: State<'_, Runtime>, generation: u64) -> Result<()
                 "llama-server завершился {exit}. Вывод сервера:\n{log}"
             ));
         }
-        if reqwest::get("http://127.0.0.1:8080/health")
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-        {
-            return Ok(());
+        if let Ok(response) = reqwest::get("http://127.0.0.1:8080/health").await {
+            if response.status().is_success() {
+                // A previous llama-server may briefly keep responding while a new
+                // generation is starting. Confirm the generation is still current
+                // after the network await before reporting readiness.
+                if state.generation.load(Ordering::SeqCst) != generation {
+                    return Err("Model start cancelled".into());
+                }
+                let child_is_running = state
+                    .child
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .as_mut()
+                    .map(Child::try_wait)
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .is_some_and(|status| status.is_none());
+                if child_is_running {
+                    return Ok(());
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -577,7 +640,8 @@ pub fn run() {
             openhands::send_agent_message,
             openhands::save_model_provider_key,
             openhands::remove_model_provider_key,
-            openhands::model_provider_key_configured
+            openhands::model_provider_key_configured,
+            openhands::fetch_kilo_free_models
         ])
         .setup(|_| Ok(()))
         .build(tauri::generate_context!())

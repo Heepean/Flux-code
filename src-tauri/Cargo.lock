@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "flux-hands"
-version = "1.0.5"
+version = "1.0.7"
 dependencies = [
  "futures-util",
  "keyring",
@@ -1228,12 +1228,14 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
  "zip 2.4.2",
 ]
 
