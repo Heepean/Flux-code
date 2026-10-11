@@ -281,7 +281,10 @@ pub fn run() {
             openhands::start_agent_server,
             openhands::stop_agent_server,
             openhands::get_agent_server_status,
-            openhands::send_agent_message
+            openhands::send_agent_message,
+            openhands::save_model_provider_key,
+            openhands::remove_model_provider_key,
+            openhands::model_provider_key_configured
         ])
         .setup(|_| Ok(()))
         .build(tauri::generate_context!())

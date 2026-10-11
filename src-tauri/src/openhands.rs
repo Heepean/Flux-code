@@ -20,7 +20,7 @@ pub struct AgentServerState {
     child: Mutex<Option<Child>>,
     port: Mutex<Option<u16>>,
     session_key: Mutex<Option<String>>,
-    config: Mutex<Option<(String, String)>>,
+    config: Mutex<Option<(String, String, String, String)>>,
     log: Arc<Mutex<String>>,
 }
 
@@ -189,6 +189,57 @@ fn status(state: &AgentServerState) -> AgentServerStatus {
     }
 }
 
+fn remote_key_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new("Flux Hands Model Provider", "openai-compatible")
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn save_model_provider_key(api_key: String) -> Result<(), String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("Введите API-ключ или оставьте поле пустым для локального endpoint".into());
+    }
+    remote_key_entry()?
+        .set_password(api_key)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn remove_model_provider_key() -> Result<(), String> {
+    match remote_key_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn model_provider_key_configured() -> Result<bool, String> {
+    Ok(remote_key_entry()?.get_password().is_ok())
+}
+
+fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
+    let mut parsed = reqwest::Url::parse(endpoint.trim())
+        .map_err(|_| "Введите корректный URL OpenAI-compatible endpoint".to_string())?;
+    let host = parsed.host_str().unwrap_or_default();
+    let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        return Err(
+            "Удалённый endpoint должен использовать HTTPS. HTTP разрешён только для localhost."
+                .into(),
+        );
+    }
+    let mut path = parsed.path().trim_end_matches('/').to_string();
+    if path.ends_with("/chat/completions") {
+        path.truncate(path.len() - "/chat/completions".len());
+    }
+    if !path.ends_with("/v1") {
+        path.push_str("/v1");
+    }
+    parsed.set_path(&path);
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
 #[tauri::command]
 pub fn get_agent_server_status(state: State<'_, AgentServerState>) -> AgentServerStatus {
     status(&state)
@@ -199,7 +250,9 @@ pub async fn start_agent_server(
     app: AppHandle,
     state: State<'_, AgentServerState>,
     workspace: String,
+    provider: String,
     model: String,
+    endpoint: String,
 ) -> Result<AgentServerStatus, String> {
     let workspace = Path::new(&workspace)
         .canonicalize()
@@ -209,9 +262,51 @@ pub async fn start_agent_server(
     }
     let model = model.trim();
     if model.is_empty() {
-        return Err("Сначала выберите локальную модель".into());
+        return Err("Сначала выберите модель".into());
     }
-    let config = (workspace.to_string_lossy().into_owned(), model.to_owned());
+    let provider = provider.trim().to_ascii_lowercase();
+    if provider != "local" && provider != "remote" {
+        return Err("Выберите локальную модель или OpenAI-compatible endpoint".into());
+    }
+    let endpoint = if provider == "local" {
+        "http://127.0.0.1:8080/v1".to_string()
+    } else {
+        normalize_endpoint(&endpoint)?
+    };
+    let api_key = if provider == "local" {
+        "local".to_string()
+    } else {
+        remote_key_entry()
+            .ok()
+            .and_then(|entry| entry.get_password().ok())
+            .unwrap_or_default()
+    };
+    let is_loopback = reqwest::Url::parse(&endpoint)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1")
+        })
+        .unwrap_or(false);
+    if provider == "remote" && api_key.is_empty() && !is_loopback {
+        return Err("Сохраните API-ключ в разделе моделей. Для локальных Ollama/LM Studio ключ можно не задавать.".into());
+    }
+    let api_key = if api_key.is_empty() {
+        "local".to_string()
+    } else {
+        api_key
+    };
+    let model_id = if provider == "local" {
+        "openai/local-model".to_string()
+    } else {
+        format!("openai/{model}")
+    };
+    let config = (
+        workspace.to_string_lossy().into_owned(),
+        provider.clone(),
+        endpoint.clone(),
+        model.to_owned(),
+    );
     {
         let mut child = state.child.lock().map_err(|error| error.to_string())?;
         if let Some(current) = child.as_mut() {
@@ -268,9 +363,9 @@ pub async fn start_agent_server(
         .env("OH_BASH_EVENTS_DIR", directory.join("bash-events"))
         .env("OH_VSCODE_PORT", vscode_port.to_string())
         .env("OH_WORKING_DIR", &workspace)
-        .env("LLM_MODEL", "openai/local-model")
-        .env("LLM_API_KEY", "local")
-        .env("LLM_BASE_URL", "http://127.0.0.1:8080/v1")
+        .env("LLM_MODEL", &model_id)
+        .env("LLM_API_KEY", &api_key)
+        .env("LLM_BASE_URL", &endpoint)
         .env("PYTHONUTF8", "1")
         .env("DO_NOT_TRACK", "1")
         .env("VITE_DO_NOT_TRACK", "1")
@@ -340,9 +435,9 @@ pub async fn start_agent_server(
             if response.status().is_success() {
                 let profile = serde_json::json!({
                     "llm": {
-                        "model": "openai/local-model",
-                        "api_key": "local",
-                        "base_url": "http://127.0.0.1:8080/v1"
+                        "model": &model_id,
+                        "api_key": &api_key,
+                        "base_url": &endpoint
                     },
                     "include_secrets": true
                 });

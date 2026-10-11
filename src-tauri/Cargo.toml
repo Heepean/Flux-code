@@ -1,6 +1,6 @@
 [package]
 name = "flux-hands"
-version = "1.0.0"
+version = "1.0.1"
 description = "Local-first AI development studio"
 authors = ["Flux Code"]
 edition = "2021"
@@ -24,3 +24,4 @@ uuid = { version = "1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tauri-plugin-updater = "2.13.3"
 tauri-plugin-process = "2.4.0"
+keyring = { version = "4.2.0", default-features = false, features = ["v1", "windows-native-keyring-store"] }
