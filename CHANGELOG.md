@@ -1,5 +1,10 @@
 # История изменений
 
+## v1.0.10
+
+- Скрыты локальные GGUF и llama.cpp настройки на Android; мобильная версия оставлена для удалённых OpenHands Agent Server и моделей.
+- Windows desktop сохраняет локальную загрузку GGUF и Hugging Face каталог.
+
 ## v1.0.9
 
 - Updated Android CI SDK setup to the current supported action version.
