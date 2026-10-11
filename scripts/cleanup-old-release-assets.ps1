@@ -21,7 +21,7 @@ $removed = 0
 
 foreach ($release in $staleReleases) {
     foreach ($asset in $release.assets) {
-        if ($asset.name -notmatch '(?i)(setup\.exe|\.msi|\.exe\.sig$|^latest\.json$)') {
+        if ($asset.name -notmatch '(?i)(setup\.exe|\.msi|\.apk$|\.exe\.sig$|^latest\.json$)') {
             continue
         }
 

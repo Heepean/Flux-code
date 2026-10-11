@@ -63,6 +63,12 @@ fn available_physical_memory() -> Result<u64, String> {
 
 #[tauri::command]
 fn browse_directory() -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    return Err(
+        "Выбор папки доступен на desktop; на Android укажите workspace на удалённом Agent Server"
+            .into(),
+    );
+    #[cfg(not(target_os = "android"))]
     Ok(rfd::FileDialog::new()
         .pick_folder()
         .map(|p| p.to_string_lossy().into_owned()))
@@ -70,6 +76,9 @@ fn browse_directory() -> Result<Option<String>, String> {
 
 #[tauri::command]
 fn browse_gguf() -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    return Err("Локальные GGUF-модели доступны только в desktop-сборке".into());
+    #[cfg(not(target_os = "android"))]
     Ok(rfd::FileDialog::new()
         .add_filter("GGUF model", &["gguf"])
         .pick_file()
@@ -78,6 +87,9 @@ fn browse_gguf() -> Result<Option<String>, String> {
 
 #[tauri::command]
 fn browse_executable() -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    return Err("llama.cpp доступен только в desktop-сборке".into());
+    #[cfg(not(target_os = "android"))]
     Ok(rfd::FileDialog::new()
         .add_filter("llama-server executable", &["exe"])
         .pick_file()
@@ -607,9 +619,12 @@ async fn wait_for_model(state: State<'_, Runtime>, generation: u64) -> Result<()
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let application = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(not(target_os = "android"))]
+    let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_process::init());
+    let application = builder
         .manage(Runtime {
             child: Mutex::new(None),
             generation: AtomicU64::new(0),
@@ -635,12 +650,16 @@ pub fn run() {
             wait_for_model,
             download_model,
             openhands::start_agent_server,
+            openhands::connect_remote_agent_server,
             openhands::stop_agent_server,
             openhands::get_agent_server_status,
             openhands::send_agent_message,
             openhands::save_model_provider_key,
             openhands::remove_model_provider_key,
             openhands::model_provider_key_configured,
+            openhands::save_remote_agent_key,
+            openhands::get_remote_agent_key,
+            openhands::remove_remote_agent_key,
             openhands::fetch_kilo_free_models
         ])
         .setup(|_| Ok(()))

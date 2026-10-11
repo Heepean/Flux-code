@@ -2,6 +2,7 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/.tauri/
+src-tauri/gen/android/
 *.log
 *.tmp
 OpenHands-1.26.0.zip

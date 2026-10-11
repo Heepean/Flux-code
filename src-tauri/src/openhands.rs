@@ -21,6 +21,7 @@ pub struct AgentServerState {
     port: Mutex<Option<u16>>,
     session_key: Mutex<Option<String>>,
     config: Mutex<Option<(String, String, String, String, String)>>,
+    remote_base: Mutex<Option<String>>,
     log: Arc<Mutex<String>>,
 }
 
@@ -30,6 +31,17 @@ pub struct AgentServerStatus {
     pub url: Option<String>,
     pub version: &'static str,
     pub log: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentConnection {
+    pub url: String,
+    pub session_api_key: String,
+    pub workspace: String,
+    pub provider: String,
+    pub model: String,
+    pub endpoint: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -163,23 +175,31 @@ fn saved_session_key(app: &AppHandle) -> Result<String, String> {
 }
 
 fn status(state: &AgentServerState) -> AgentServerStatus {
-    let running = state
-        .child
+    let connected_remote = state
+        .remote_base
         .lock()
         .ok()
-        .and_then(|mut child| {
-            child.as_mut().map(|child| match child.try_wait() {
-                Ok(Some(_)) => false,
-                Ok(None) => true,
-                Err(_) => false,
+        .is_some_and(|base| base.is_some());
+    let running = connected_remote
+        || state
+            .child
+            .lock()
+            .ok()
+            .and_then(|mut child| {
+                child.as_mut().map(|child| match child.try_wait() {
+                    Ok(Some(_)) => false,
+                    Ok(None) => true,
+                    Err(_) => false,
+                })
             })
-        })
-        .unwrap_or(false);
+            .unwrap_or(false);
     let port = state.port.lock().ok().and_then(|port| *port);
     let log = state.log.lock().map(|log| log.clone()).unwrap_or_default();
     AgentServerStatus {
         running,
-        url: if running {
+        url: if connected_remote {
+            state.remote_base.lock().ok().and_then(|base| base.clone())
+        } else if running {
             port.map(|port| format!("http://127.0.0.1:{port}"))
         } else {
             None
@@ -192,6 +212,39 @@ fn status(state: &AgentServerState) -> AgentServerStatus {
 fn remote_key_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new("Flux Hands Model Provider", "openai-compatible")
         .map_err(|error| error.to_string())
+}
+
+fn remote_agent_key_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new("Flux Hands Agent Server", "remote-session-api-key")
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn save_remote_agent_key(api_key: String) -> Result<(), String> {
+    let api_key = api_key.trim();
+    if api_key.len() < 16 {
+        return Err("Введите действующий session API key OpenHands".into());
+    }
+    remote_agent_key_entry()?
+        .set_password(api_key)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn get_remote_agent_key() -> Result<Option<String>, String> {
+    match remote_agent_key_entry()?.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn remove_remote_agent_key() -> Result<(), String> {
+    match remote_agent_key_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -300,6 +353,17 @@ pub async fn fetch_kilo_free_models() -> Result<Vec<serde_json::Value>, String> 
             })
         })
         .collect::<Vec<_>>();
+    free_models.retain(|model| {
+        model.get("id").and_then(serde_json::Value::as_str) != Some("kilo-auto/free")
+    });
+    free_models.push(serde_json::json!({
+        "id": "kilo-auto/free",
+        "name": "Kilo Auto Free",
+        "description": "Kilo automatically selects an available free model; no account or API key required.",
+        "contextLength": null,
+        "mayTrainOnYourPrompts": false,
+        "supportsTools": true
+    }));
     free_models.sort_by(|a, b| {
         a.get("name")
             .and_then(serde_json::Value::as_str)
@@ -335,6 +399,10 @@ pub async fn start_agent_server(
     if !workspace.is_dir() {
         return Err("Путь проекта не является папкой".into());
     }
+    *state
+        .remote_base
+        .lock()
+        .map_err(|error| error.to_string())? = None;
     let model = model.trim();
     if model.is_empty() {
         return Err("Сначала выберите модель".into());
@@ -529,6 +597,120 @@ pub async fn start_agent_server(
 }
 
 #[tauri::command]
+pub async fn connect_remote_agent_server(
+    app: AppHandle,
+    state: State<'_, AgentServerState>,
+    connection: RemoteAgentConnection,
+) -> Result<AgentServerStatus, String> {
+    let mut parsed = reqwest::Url::parse(connection.url.trim())
+        .map_err(|_| "Введите корректный URL удалённого Agent Server".to_string())?;
+    if parsed.host_str().is_none() {
+        return Err("В URL Agent Server не указан сервер".into());
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    let is_loopback =
+        host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && is_loopback) {
+        return Err(
+            "Удалённый Agent Server должен использовать HTTPS. HTTP разрешён только для localhost."
+                .into(),
+        );
+    }
+    parsed.set_path("");
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let key = connection.session_api_key.trim();
+    if key.len() < 16 {
+        return Err("Введите действующий session API key OpenHands".into());
+    }
+    if connection.workspace.trim().is_empty() {
+        return Err("Укажите путь проекта на удалённом сервере".into());
+    }
+    let provider = connection.provider.trim().to_ascii_lowercase();
+    if provider != "remote" && provider != "kilo" {
+        return Err("Android поддерживает только удалённые модели".into());
+    }
+    let model = connection.model.trim();
+    if model.is_empty() {
+        return Err("Сначала выберите удалённую модель".into());
+    }
+    let endpoint = if provider == "kilo" {
+        KILO_GATEWAY_BASE.to_string()
+    } else {
+        normalize_endpoint(&connection.endpoint)?
+    };
+    let api_key = if provider == "kilo" {
+        "anonymous".to_string()
+    } else {
+        remote_key_entry()
+            .ok()
+            .and_then(|entry| entry.get_password().ok())
+            .unwrap_or_default()
+    };
+    let is_loopback = reqwest::Url::parse(&endpoint)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1")
+        })
+        .unwrap_or(false);
+    if provider == "remote" && api_key.is_empty() && !is_loopback {
+        return Err("Сохраните API-ключ провайдера в настройках удалённых моделей".into());
+    }
+    let api_key = if api_key.is_empty() {
+        "local".into()
+    } else {
+        api_key
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(
+            parsed
+                .join("/api/conversations")
+                .map_err(|error| error.to_string())?,
+        )
+        .header("X-Session-API-Key", key)
+        .send()
+        .await
+        .map_err(|error| format!("Не удалось подключиться к Agent Server: {error}"))?;
+    if response.status().is_server_error() || response.status().as_u16() == 404 {
+        return Err(format!("Agent Server недоступен по адресу {}", parsed));
+    }
+    if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+        return Err("Agent Server отклонил session API key".into());
+    }
+    // OpenHands versions may return either a list or a paginated object here;
+    // a successful authenticated response is sufficient for connectivity.
+    if !response.status().is_success() {
+        return Err(format!("Agent Server вернул HTTP {}", response.status()));
+    }
+    let workspace = connection.workspace.trim().to_owned();
+    let config = (workspace, provider, endpoint, model.to_owned(), api_key);
+    *state.config.lock().map_err(|error| error.to_string())? = Some(config);
+    *state
+        .session_key
+        .lock()
+        .map_err(|error| error.to_string())? = Some(key.to_owned());
+    *state.port.lock().map_err(|error| error.to_string())? = None;
+    *state
+        .remote_base
+        .lock()
+        .map_err(|error| error.to_string())? =
+        Some(parsed.to_string().trim_end_matches('/').to_owned());
+    let _ = app;
+    Ok(AgentServerStatus {
+        running: true,
+        url: Some(parsed.to_string().trim_end_matches('/').to_owned()),
+        version: SERVER_VERSION,
+        log: "Подключено к удалённому OpenHands Agent Server".into(),
+    })
+}
+
+#[tauri::command]
 pub fn stop_agent_server(state: State<'_, AgentServerState>) -> Result<(), String> {
     if let Some(mut child) = state
         .child
@@ -544,6 +726,11 @@ pub fn stop_agent_server(state: State<'_, AgentServerState>) -> Result<(), Strin
         .session_key
         .lock()
         .map_err(|error| error.to_string())? = None;
+    *state
+        .remote_base
+        .lock()
+        .map_err(|error| error.to_string())? = None;
+    *state.config.lock().map_err(|error| error.to_string())? = None;
     Ok(())
 }
 
@@ -554,12 +741,13 @@ pub async fn send_agent_message(
     message: String,
     conversation_id: Option<String>,
 ) -> Result<String, String> {
-    let (port, key, config) = {
-        let port = state
-            .port
+    let (base, key, config) = {
+        let port = state.port.lock().map_err(|error| error.to_string())?;
+        let remote_base = state
+            .remote_base
             .lock()
             .map_err(|error| error.to_string())?
-            .ok_or("OpenHands Agent Server is not running")?;
+            .clone();
         let key = state
             .session_key
             .lock()
@@ -572,7 +760,14 @@ pub async fn send_agent_message(
             .map_err(|error| error.to_string())?
             .clone()
             .ok_or("OpenHands model configuration is missing")?;
-        (port, key, config)
+        let base = match remote_base {
+            Some(base) => base,
+            None => format!(
+                "http://127.0.0.1:{}",
+                port.ok_or("OpenHands Agent Server is not running")?
+            ),
+        };
+        (base, key, config)
     };
     let (workspace, provider, endpoint, model, api_key) = config;
     let model_id = if provider == "local" {
@@ -584,7 +779,7 @@ pub async fn send_agent_message(
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|error| error.to_string())?;
-    let base = format!("http://127.0.0.1:{port}/api/conversations");
+    let base = format!("{base}/api/conversations");
     let headers = [("X-Session-API-Key", key)];
     let mut conversation_id = conversation_id;
     if let Some(id) = conversation_id.as_deref() {

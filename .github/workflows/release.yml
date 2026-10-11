@@ -89,3 +89,49 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/cleanup-old-release-assets.ps1
+
+  android:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager 'platform-tools' 'platforms;android-37' 'build-tools;36.0.0' 'ndk;27.2.12479018'
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Initialize Android project
+        run: npm run tauri -- android init --ci --skip-targets-install
+      - name: Build installable Android ARM64 test APK
+        run: npm run tauri -- android build --debug --apk --target aarch64 --config src-tauri/tauri.android.conf.json
+      - name: Prepare APK release asset
+        id: android_asset
+        run: |
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*arm64-v8a-debug*.apk' | head -n 1)
+          if [ -z "$apk" ]; then apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1); fi
+          test -n "$apk"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
+          cp "$apk" "$RUNNER_TEMP/Flux.Hands_${GITHUB_REF_NAME}_android-arm64-debug.apk"
+          echo "apk=$RUNNER_TEMP/Flux.Hands_${GITHUB_REF_NAME}_android-arm64-debug.apk" >> "$GITHUB_OUTPUT"
+      - name: Upload Android APK to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ steps.android_asset.outputs.apk }}

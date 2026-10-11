@@ -4,3 +4,62 @@
 .path-control{display:flex;gap:6px}.path-control input{flex:1;min-width:0}.path-control button{border:1px solid #3b3e37;border-radius:4px;padding:0 9px;color:#b4b8ae;font-size:9px}
 .remote-model-config{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:0 0 22px;padding:14px;background:#181a18;border:1px solid #2d302b;border-radius:6px}.remote-model-config>.section-title,.remote-model-config>.settings-notice,.remote-model-config>.manager-button-row{grid-column:1/-1}.remote-model-config label{display:flex;flex-direction:column;gap:7px;color:#92968c;font-size:10px}.remote-model-config input,.remote-model-config select{height:34px;padding:0 10px;background:#191b19;border:1px solid #333630;border-radius:4px;color:#d0d2ca;outline:none;font:10px DM Mono,monospace}.remote-model-config input:focus,.remote-model-config select:focus{border-color:#718368}.remote-model-config .settings-notice{color:#85897f;line-height:1.5}.remote-model-config .manager-button-row{margin:0}
 .kilo-catalog{display:grid;gap:9px;margin-top:12px;padding:12px;border:1px solid #343a32;border-radius:6px;background:#191c19}.kilo-catalog-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.kilo-catalog-head>div{display:grid;gap:4px}.kilo-catalog-head b{font-size:11px;color:#d8ddd3}.kilo-catalog-head small,.kilo-model-info small{font:9px 'DM Mono';color:#81877e}.kilo-filter{height:32px;padding:0 9px;background:#141614;border:1px solid #333831;border-radius:4px;outline:0;color:#d6d9d1;font-size:10px}.kilo-filter:focus{border-color:#718368}.kilo-model{display:flex;align-items:center;gap:10px;width:100%;min-height:43px;padding:7px 9px;text-align:left;border:1px solid #30352e;border-radius:4px;background:#1d201d;color:#d1d5cc}.kilo-model:hover,.kilo-model.selected{border-color:#78906f;background:#242a22}.kilo-model-info{display:grid;gap:4px;min-width:0;flex:1}.kilo-model-info b{font-size:10px;font-weight:550}.kilo-model-info small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.kilo-free-tag,.kilo-tools-tag,.kilo-chat-tag{padding:3px 5px;border-radius:3px;font:8px 'DM Mono';white-space:nowrap}.kilo-free-tag{background:#2c3929;color:#b9d5aa}.kilo-tools-tag{background:#263537;color:#a8d0cc}.kilo-chat-tag{background:#39342b;color:#d2bd91}.kilo-selected{color:#bbd5ad;font-size:9px;white-space:nowrap}.kilo-catalog>.settings-notice{line-height:1.6;color:#93978e}
+
+/* Android is a remote-agent client. */
+.android-remote-setup{display:grid;gap:12px;margin:0 0 16px;padding:16px;border:1px solid #394237;border-radius:8px;background:#1a1e19}
+.android-remote-setup>div:first-child small{font:9px 'DM Mono';letter-spacing:1.2px;color:#b1d3a7}
+.android-remote-setup h2{margin:7px 0;font:600 20px Manrope,sans-serif;color:#e3e5dd}
+.android-remote-setup p{margin:0;color:#92968d;font-size:12px;line-height:1.6}
+.android-remote-setup label{display:grid;gap:6px;color:#a5aa9e;font-size:11px}
+.android-remote-setup input{height:42px;width:100%;padding:0 12px;border:1px solid #383d35;border-radius:6px;background:#141614;color:#e1e4db;outline:0;font:12px 'DM Sans',sans-serif}
+.android-remote-setup input:focus{border-color:#819777}
+.android-remote-setup .settings-notice{line-height:1.6;color:#9a9e94}
+@media(max-width:700px){
+ body{min-width:0;min-height:100dvh}
+ #root,.app{height:100dvh;min-height:0}
+ .android-app .titlebar{height:48px;flex:none;padding:0 13px;padding-top:env(safe-area-inset-top);box-sizing:content-box}
+ .android-app .alpha,.android-app .title-center,.android-app .window-dots{display:none}
+ .android-app .title-actions{margin-left:auto}
+ .android-app .toolbar{height:38px;flex:none}
+ .android-app .toolbar-left{padding-left:9px}
+ .android-app .toolbar-left button:nth-child(n+3){display:none}
+ .android-app .breadcrumb{margin-left:8px}
+ .android-app .toolbar-right{max-width:42%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+ .android-app .activity,.android-app .sidebar{display:none}
+ .android-app .layout,.android-app .main{min-height:0;min-width:0}
+ .android-app .tabs{height:38px;flex:none}
+ .android-app .tab-spacer,.android-app .editor-action,.android-app .new-tab{display:none}
+ .android-app .tab{padding:0 12px}
+ .android-app .agent-topline{height:48px;padding:0 14px}
+ .android-app .session-id{display:none}
+ .android-app .conversation{width:calc(100% - 28px);padding-bottom:12px}
+ .android-app .welcome{transform:none;padding:24px 0}
+ .android-app .welcome h1{font-size:34px}
+ .android-app .welcome p{font-size:13px;line-height:1.65}
+ .android-app .suggestions{flex-wrap:wrap;gap:7px;margin-top:17px}
+ .android-app .suggestions button{height:36px;padding:0 9px;font-size:10px}
+ .android-app .message{gap:9px;padding:13px 0}
+ .android-app .composer-wrap{width:calc(100% - 20px);margin:0 auto calc(10px + env(safe-area-inset-bottom))}
+ .android-app .composer{padding:10px;border-radius:10px}
+ .android-app .composer textarea{min-height:66px;font-size:14px}
+ .android-app .composer-hint{font-size:0;gap:0}
+ .android-app .send-button{width:42px;height:40px}
+ .android-app .composer-note{font-size:10px;line-height:1.4;flex-wrap:wrap}
+ .android-app .note-right{display:none}
+ .android-app .statusbar{height:26px;flex:none;padding-bottom:env(safe-area-inset-bottom);box-sizing:content-box}
+ .android-app .models-view{padding:20px 14px calc(20px + env(safe-area-inset-bottom))}
+ .android-app .view-title{align-items:flex-start;margin-bottom:14px}
+ .android-app .view-title h1{font-size:23px}
+ .android-app .view-title p{font-size:12px;line-height:1.5}
+ .android-app .view-title .chip,.android-app .active-model,.android-app .settings-grid,.android-app .local-section,.android-app .hf-section{display:none}
+ .android-app .remote-model-config{display:flex;flex-direction:column;gap:12px;padding:12px;margin-bottom:0}
+ .android-app .remote-model-config .section-title{margin-bottom:0}
+ .android-app .remote-model-config label{font-size:11px}
+ .android-app .remote-model-config input,.android-app .remote-model-config select{height:42px;font:13px 'DM Sans',sans-serif}
+ .android-app .remote-model-config>.settings-notice{font-size:10px;line-height:1.55}
+ .android-app .manager-button-row{display:flex;gap:8px;flex-wrap:wrap}
+ .android-app .manager-button{min-height:40px}
+ .android-app .kilo-catalog{padding:10px;margin-top:0}
+ .android-app .kilo-model{min-height:48px}
+ .android-app .models-view,.android-app .agent-view{overscroll-behavior:contain}
+}

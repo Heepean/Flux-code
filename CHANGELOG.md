@@ -1,5 +1,11 @@
 # История изменений
 
+## v1.0.8
+
+- Android ARM64 APK builds are integrated with GitHub Releases.
+- Added Android-specific permissions for remote OpenHands Agent Server use.
+- Android release requires an HTTPS-accessible remote Agent Server; local GGUF inference stays on desktop.
+
 ## v1.0.7
 
 - Установщик содержит исправления проверки готовности локальной модели: приложение подтверждает ответ текущего процесса llama-server.
