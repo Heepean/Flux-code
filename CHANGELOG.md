@@ -4,6 +4,8 @@
 
 - Updated Android CI SDK setup to the current supported action version.
 - Android ARM64 test APK is built and signature-verified before upload to GitHub Releases.
+- Fixed OpenHands connectivity probe to call the authenticated conversation-search endpoint.
+- Fixed a deadlock when reusing the current desktop Agent Server for a follow-up task.
 
 ## v1.0.8
 

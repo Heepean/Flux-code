@@ -14,13 +14,14 @@ const SERVER_VERSION: &str = "1.26.0";
 const KILO_GATEWAY_BASE: &str = "https://api.kilo.ai/api/gateway";
 const UV_RELEASE_API: &str = "https://api.github.com/repos/astral-sh/uv/releases/latest";
 const UV_WINDOWS_ARCHIVE: &str = "uv-x86_64-pc-windows-msvc.zip";
+type AgentConfig = (String, String, String, String, String);
 
 #[derive(Default)]
 pub struct AgentServerState {
     child: Mutex<Option<Child>>,
     port: Mutex<Option<u16>>,
     session_key: Mutex<Option<String>>,
-    config: Mutex<Option<(String, String, String, String, String)>>,
+    config: Mutex<Option<AgentConfig>>,
     remote_base: Mutex<Option<String>>,
     log: Arc<Mutex<String>>,
 }
@@ -76,6 +77,8 @@ fn hidden(command: &mut Command) {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn installed_uvx(app: &AppHandle) -> Option<PathBuf> {
@@ -207,6 +210,34 @@ fn status(state: &AgentServerState) -> AgentServerStatus {
         version: SERVER_VERSION,
         log,
     }
+}
+
+fn reuse_or_stop_existing_agent(
+    state: &AgentServerState,
+    config: &AgentConfig,
+) -> Result<bool, String> {
+    let mut child = state.child.lock().map_err(|error| error.to_string())?;
+    if let Some(current) = child.as_mut() {
+        if current
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            if state
+                .config
+                .lock()
+                .map_err(|error| error.to_string())?
+                .as_ref()
+                == Some(config)
+            {
+                return Ok(true);
+            }
+            let _ = current.kill();
+            let _ = current.wait();
+            *child = None;
+        }
+    }
+    Ok(false)
 }
 
 fn remote_key_entry() -> Result<keyring::Entry, String> {
@@ -457,28 +488,8 @@ pub async fn start_agent_server(
         model.to_owned(),
         api_key.clone(),
     );
-    {
-        let mut child = state.child.lock().map_err(|error| error.to_string())?;
-        if let Some(current) = child.as_mut() {
-            if current
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_none()
-            {
-                if state
-                    .config
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .as_ref()
-                    == Some(&config)
-                {
-                    return Ok(status(&state));
-                }
-                let _ = current.kill();
-                let _ = current.wait();
-                *child = None;
-            }
-        }
+    if reuse_or_stop_existing_agent(&state, &config)? {
+        return Ok(status(&state));
     }
     let executable = install_uvx(&app).await?;
     let port = free_port()?;
@@ -670,7 +681,7 @@ pub async fn connect_remote_agent_server(
     let response = client
         .get(
             parsed
-                .join("/api/conversations")
+                .join("/api/conversations/search?limit=1")
                 .map_err(|error| error.to_string())?,
         )
         .header("X-Session-API-Key", key)
@@ -1118,7 +1129,42 @@ async fn ensure_success_json(
 
 #[cfg(test)]
 mod tests {
-    use super::kilo_model_is_free_text;
+    use super::{
+        kilo_model_is_free_text, reuse_or_stop_existing_agent, status, AgentConfig,
+        AgentServerState,
+    };
+    use std::process::{Command, Stdio};
+
+    #[cfg(windows)]
+    #[test]
+    fn reusing_the_current_agent_releases_the_child_lock_before_status() {
+        let state = AgentServerState::default();
+        let config: AgentConfig = (
+            "workspace".into(),
+            "kilo".into(),
+            "https://api.kilo.ai/api/gateway".into(),
+            "kilo-auto/free".into(),
+            "anonymous".into(),
+        );
+        let mut command = Command::new("ping.exe");
+        command
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("start temporary ping process");
+        *state.child.lock().expect("lock child state") = Some(child);
+        *state.config.lock().expect("lock config state") = Some(config.clone());
+
+        assert!(reuse_or_stop_existing_agent(&state, &config).expect("reuse agent"));
+        assert!(status(&state).running);
+
+        let child = state.child.lock().expect("lock child state").take();
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 
     #[test]
     fn kilo_catalog_keeps_free_text_models_including_chat_only_models() {
