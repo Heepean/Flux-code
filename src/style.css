@@ -76,3 +76,13 @@
 .search-result-line{color:var(--muted);font:11px 'Cascadia Code',monospace}
 .workspace-search-result code{overflow:hidden;color:var(--text);text-overflow:ellipsis;white-space:nowrap;font:12px 'Cascadia Code',monospace}
 .empty-search{padding:20px;color:var(--muted);font-size:13px}
+.git-view{height:100%;overflow:auto;padding:36px 42px;color:var(--text);background:var(--surface)}
+.git-view .view-title{align-items:center}
+.git-branch-card{display:flex;align-items:center;gap:10px;max-width:760px;padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--accent)}
+.git-branch-card span{margin-left:auto;color:var(--muted);font-size:12px}
+.git-change-list{display:flex;flex-direction:column;gap:4px;max-width:900px;margin-top:16px}
+.git-change{display:flex;align-items:center;gap:12px;min-height:38px;padding:7px 10px;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--text);text-align:left;cursor:pointer}
+.git-change:hover{border-color:var(--line);background:var(--panel)}
+.git-change-code{width:28px;color:var(--accent);font:12px 'Cascadia Code',monospace}
+.git-change-path{flex:1;overflow:hidden;color:var(--muted);text-overflow:ellipsis;white-space:nowrap;font:12px 'Cascadia Code',monospace}
+.git-change svg{color:var(--accent)}

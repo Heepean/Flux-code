@@ -45,6 +45,18 @@ struct SearchResult {
     preview: String,
 }
 
+#[derive(Serialize)]
+struct GitChange {
+    code: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct GitStatus {
+    branch: String,
+    changes: Vec<GitChange>,
+}
+
 fn ignored_search_directory(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -399,6 +411,79 @@ fn search_workspace_files(path: &Path, query: &str) -> Result<Vec<SearchResult>,
         }
     }
     Ok(results)
+}
+
+fn git_output(path: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+        .output()
+        .map_err(|error| format!("Не удалось запустить Git: {error}"))
+}
+
+#[tauri::command]
+fn git_status(path: String) -> Result<GitStatus, String> {
+    if !Path::new(&path).is_dir() {
+        return Err("Папка проекта недоступна".into());
+    }
+    let root = git_output(&path, &["rev-parse", "--show-toplevel"])?;
+    if !root.status.success() {
+        return Err("Открытая папка не является Git-репозиторием".into());
+    }
+    let branch_output = git_output(&path, &["symbolic-ref", "--short", "-q", "HEAD"])?;
+    let branch = if branch_output.status.success() {
+        String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_owned()
+    } else {
+        let commit = git_output(&path, &["rev-parse", "--short", "HEAD"])?;
+        if !commit.status.success() {
+            return Err("Не удалось определить текущую ветку или commit".into());
+        }
+        format!(
+            "HEAD detached at {}",
+            String::from_utf8_lossy(&commit.stdout).trim()
+        )
+    };
+    let status = git_output(
+        &path,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    if !status.status.success() {
+        return Err(format!(
+            "Git не смог прочитать состояние проекта: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    let mut changes = Vec::new();
+    let mut entries = status.stdout.split(|byte| *byte == 0).peekable();
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let code = String::from_utf8_lossy(&entry[..2]).to_string();
+        let relative = String::from_utf8_lossy(&entry[3..]).into_owned();
+        let full_path = Path::new(&path)
+            .join(&relative)
+            .to_string_lossy()
+            .into_owned();
+        changes.push(GitChange {
+            code,
+            path: full_path,
+        });
+        if entry[..2].contains(&b'R') || entry[..2].contains(&b'C') {
+            let _ = entries.next();
+        }
+        if changes.len() >= 2000 {
+            break;
+        }
+    }
+    Ok(GitStatus { branch, changes })
 }
 
 #[tauri::command]
@@ -758,6 +843,7 @@ pub fn run() {
             install_llama_runtime,
             scan_models,
             search_workspace,
+            git_status,
             read_text_file,
             write_text_file,
             start_local_model,
@@ -802,9 +888,11 @@ pub fn run() {
 #[cfg(test)]
 mod workspace_search_tests {
     use super::{
-        ignored_search_directory, matching_lines, search_workspace, search_workspace_files,
+        git_status, ignored_search_directory, matching_lines, search_workspace,
+        search_workspace_files,
     };
     use std::fs;
+    use std::process::Command;
 
     #[test]
     fn search_matches_case_insensitively_and_keeps_line_numbers() {
@@ -853,5 +941,47 @@ mod workspace_search_tests {
     fn workspace_search_rejects_empty_and_excessive_queries() {
         assert!(search_workspace("missing-project".into(), "  ".into()).is_err());
         assert!(search_workspace("missing-project".into(), "x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn git_status_reports_branch_modified_and_untracked_files() {
+        let root = std::env::temp_dir().join(format!("flux-hands-git-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init", "-b", "test-branch"]).status.success());
+        assert!(
+            run(&["config", "user.email", "flux-hands-test@example.invalid"])
+                .status
+                .success()
+        );
+        assert!(run(&["config", "user.name", "Flux Hands Test"])
+            .status
+            .success());
+        fs::write(root.join("tracked.txt"), "before").unwrap();
+        assert!(run(&["add", "tracked.txt"]).status.success());
+        assert!(run(&["commit", "-m", "initial"]).status.success());
+        fs::write(root.join("tracked.txt"), "after").unwrap();
+        fs::write(root.join("new file.txt"), "new").unwrap();
+
+        let status = git_status(root.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(status.branch, "test-branch");
+        assert_eq!(status.changes.len(), 2);
+        assert!(status
+            .changes
+            .iter()
+            .any(|change| change.code == " M" && change.path.ends_with("tracked.txt")));
+        assert!(status
+            .changes
+            .iter()
+            .any(|change| change.code == "??" && change.path.ends_with("new file.txt")));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
