@@ -240,6 +240,19 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
     Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
+fn take_sse_lines(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    pending.extend_from_slice(chunk);
+    let mut lines = Vec::new();
+    while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+        lines.push(
+            String::from_utf8_lossy(&pending.drain(..=end).collect::<Vec<_>>())
+                .trim()
+                .to_string(),
+        );
+    }
+    lines
+}
+
 #[tauri::command]
 pub fn get_agent_server_status(state: State<'_, AgentServerState>) -> AgentServerStatus {
     status(&state)
@@ -548,14 +561,15 @@ pub async fn send_agent_message(
         .map(str::to_owned)
         .or(conversation_id);
     let mut stream = response.bytes_stream();
-    let mut pending = String::new();
+    // Keep raw bytes until a complete SSE line is available. Converting each
+    // network chunk separately can corrupt UTF-8 characters split between
+    // chunks (especially Russian text).
+    let mut pending = Vec::new();
     let mut answer = String::new();
+    let mut announced_tool_calls = std::collections::HashSet::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| format!("Поток OpenHands прерван: {error}"))?;
-        pending.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(end) = pending.find('\n') {
-            let mut line = pending.drain(..=end).collect::<String>();
-            line = line.trim().to_string();
+        for line in take_sse_lines(&mut pending, &chunk) {
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
             };
@@ -583,7 +597,61 @@ pub async fn send_agent_message(
                     );
                 }
             }
+            // OpenHands can spend an entire response invoking tools without
+            // producing ordinary assistant text. Surface those calls in the
+            // same live stream so the UI does not look frozen.
+            if let Some(tool_calls) = value
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(serde_json::Value::as_array)
+            {
+                for tool_call in tool_calls {
+                    let index = tool_call.get("index").and_then(serde_json::Value::as_u64);
+                    let name = tool_call
+                        .pointer("/function/name")
+                        .and_then(serde_json::Value::as_str);
+                    if let (Some(index), Some(name)) = (index, name) {
+                        if announced_tool_calls.insert(index) {
+                            let activity = format!("\n\n[OpenHands] Запускает инструмент: {name}");
+                            answer.push_str(&activity);
+                            let _ = app.emit(
+                                "openhands-agent-event",
+                                AgentEvent {
+                                    delta: activity,
+                                    done: false,
+                                    conversation_id: conversation_id.clone(),
+                                    error: None,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
         }
+    }
+    if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending).trim().to_string();
+        if let Some(data) = line.strip_prefix("data:").map(str::trim) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(delta) = value
+                    .pointer("/choices/0/delta/content")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    answer.push_str(delta);
+                    let _ = app.emit(
+                        "openhands-agent-event",
+                        AgentEvent {
+                            delta: delta.to_owned(),
+                            done: false,
+                            conversation_id: conversation_id.clone(),
+                            error: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if answer.trim().is_empty() && !announced_tool_calls.is_empty() {
+        answer = "OpenHands выполнил запрос через инструменты без отдельного текстового ответа. Проверьте изменения в проекте.".into();
     }
     let _ = app.emit(
         "openhands-agent-event",
@@ -598,6 +666,29 @@ pub async fn send_agent_message(
         return Err("OpenHands завершил задачу без текстового ответа".into());
     }
     Ok(answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_sse_lines;
+
+    #[test]
+    fn sse_parser_preserves_utf8_split_between_network_chunks() {
+        let bytes = "data: {\"choices\":[{\"delta\":{\"content\":\"Привет\"}}]}\n".as_bytes();
+        let split = bytes
+            .iter()
+            .enumerate()
+            .find_map(|(index, byte)| (*byte & 0b1100_0000 == 0b1000_0000).then_some(index))
+            .expect("Russian text contains a UTF-8 continuation byte");
+        let mut pending = Vec::new();
+        assert!(take_sse_lines(&mut pending, &bytes[..split]).is_empty());
+        let lines = take_sse_lines(&mut pending, &bytes[split..]);
+        assert_eq!(
+            lines,
+            ["data: {\"choices\":[{\"delta\":{\"content\":\"Привет\"}}]}".to_string()]
+        );
+        assert!(pending.is_empty());
+    }
 }
 
 pub fn stop_on_exit(app: &AppHandle) {
