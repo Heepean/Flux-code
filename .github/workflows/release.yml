@@ -103,7 +103,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android

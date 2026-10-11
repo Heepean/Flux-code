@@ -1,5 +1,10 @@
 # История изменений
 
+## v1.0.9
+
+- Updated Android CI SDK setup to the current supported action version.
+- Android ARM64 test APK is built and signature-verified before upload to GitHub Releases.
+
 ## v1.0.8
 
 - Android ARM64 APK builds are integrated with GitHub Releases.
