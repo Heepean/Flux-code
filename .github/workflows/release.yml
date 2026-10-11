@@ -84,3 +84,8 @@ jobs:
             ${{ steps.assets.outputs.signature }}
             ${{ steps.assets.outputs.manifest }}
             src-tauri/target/release/bundle/msi/*.msi
+      - name: Remove installers from older releases
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/cleanup-old-release-assets.ps1
