@@ -16,12 +16,14 @@ Build a dependable Windows desktop workspace for projects, local GGUF models, re
 
 ## Current verified baseline (2026-10-12)
 
-- Desktop development app builds; Rust test suite passes 9 tests.
+- Desktop development app builds; Rust test suite passes 11 tests, including Windows child-process-tree cleanup and project-folder traversal rejection.
 - A temporary GGUF model ran through the native llama.cpp process manager, answered a completion, and shut down. Larger user models still depend on available RAM/VRAM.
-- The app started OpenHands Agent Server 1.26.0 in a disposable workspace and completed a Kilo Free text task, including streamed UI events and clean server shutdown.
-- That OpenHands startup logged a non-fatal browser-tool preload error (`Server.list_tools` missing); text tasks still worked. Tool actions and approval behavior are not yet verified end to end.
+- The app started OpenHands Agent Server 1.26.0 in a disposable workspace and completed a Kilo Free text task, including streamed UI events and clean server shutdown. A live `file_editor.create` action was displayed before execution: rejection kept the file absent, approval created the requested file, and the same conversation resumed after server restart.
+- That OpenHands startup logged a non-fatal browser-tool preload error (`Server.list_tools` missing); text tasks worked. A prior live dev-app scenario verified file-editor approval/rejection and conversation continuation; runtime workspace containment remains unverified.
+- A direct pinned OpenHands 1.26.0 request using the app's `openai/kilo-auto/free` model ID returned the expected Kilo response and finished; the full native UI flow still needs a desktop-window smoke test.
+- Project creation and per-project chats/transcripts are implemented and build-tested; native folder dialogs, project switching and chat reload/continuation still need UI runtime verification.
 - Windows installers and Android APK can be built locally, but a clean Windows install and a physical Android 15+ launch have not been verified. The last public beta had Windows assets; its Android workflow failed during SDK setup.
-- GitHub publication of the current 1.0.14 candidate is pending restored repository credentials.
+- Git push authentication is available; publishing v1.0.14-beta.1 remains pending the final commit/tag push and successful signed Windows/APK CI run.
 
 See [PROJECT_AUDIT.md](PROJECT_AUDIT.md) for evidence and limitations, and [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for release gates.
 

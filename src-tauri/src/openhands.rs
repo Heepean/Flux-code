@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::WorkspaceState;
+use crate::{terminate_process_tree, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -244,8 +244,7 @@ fn reuse_or_stop_existing_agent(
             {
                 return Ok(true);
             }
-            let _ = current.kill();
-            let _ = current.wait();
+            terminate_process_tree(current)?;
             *child = None;
         }
     }
@@ -745,8 +744,7 @@ pub fn stop_agent_server(state: State<'_, AgentServerState>) -> Result<(), Strin
         .map_err(|error| error.to_string())?
         .take()
     {
-        child.kill().map_err(|error| error.to_string())?;
-        let _ = child.wait();
+        terminate_process_tree(&mut child)?;
     }
     *state.port.lock().map_err(|error| error.to_string())? = None;
     *state
@@ -1309,8 +1307,7 @@ mod tests {
 
         let child = state.child.lock().expect("lock child state").take();
         if let Some(mut child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = crate::terminate_process_tree(&mut child);
         }
     }
 
@@ -1346,8 +1343,7 @@ pub fn stop_on_exit(app: &AppHandle) {
     let state = app.state::<AgentServerState>();
     if let Ok(mut child) = state.child.lock() {
         if let Some(mut child) = child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_process_tree(&mut child);
         }
     };
 }

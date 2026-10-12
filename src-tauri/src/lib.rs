@@ -38,6 +38,55 @@ impl WorkspaceState {
     }
 }
 
+pub(crate) fn terminate_process_tree(child: &mut Child) -> Result<(), String> {
+    if child
+        .try_wait()
+        .map_err(|error| format!("Не удалось проверить процесс {}: {error}", child.id()))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("taskkill.exe");
+        command
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(0x08000000);
+        let status = command
+            .status()
+            .map_err(|error| format!("Не удалось остановить дерево процессов: {error}"))?;
+        if !status.success()
+            && child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Err(format!(
+                "Windows не остановила процесс {} и его потомков",
+                child.id()
+            ));
+        }
+    }
+
+    #[cfg(not(windows))]
+    if let Err(error) = child.kill() {
+        if child
+            .try_wait()
+            .map_err(|wait_error| wait_error.to_string())?
+            .is_none()
+        {
+            return Err(format!("Не удалось остановить процесс: {error}"));
+        }
+    }
+
+    child
+        .wait()
+        .map_err(|error| format!("Не удалось дождаться остановки процесса: {error}"))?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct LlamaRelease {
     tag_name: String,
@@ -163,6 +212,69 @@ fn browse_directory(
             .transpose()?;
         Ok(selected.map(|path| path.to_string_lossy().into_owned()))
     }
+}
+
+#[tauri::command]
+fn create_project_directory(
+    app: AppHandle,
+    workspace: State<'_, WorkspaceState>,
+    parent: String,
+    name: String,
+) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (app, workspace, parent, name);
+        return Err("Создание папок проектов доступно в desktop-версии".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let path = create_project_path(Path::new(&parent), &name)?;
+        workspace.set_root(path.clone())?;
+        persist_workspace(&app, &path)?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+}
+
+fn create_project_path(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| format!("Не удалось открыть родительскую папку: {error}"))?;
+    if !parent.is_dir() {
+        return Err("Родительский путь не является папкой".into());
+    }
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.chars().any(|ch| {
+            matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control()
+        })
+    {
+        return Err("Имя проекта не должно содержать символы / \\: * ? \" < > |".into());
+    }
+    let path = parent.join(name);
+    fs::create_dir(&path).map_err(|error| format!("Не удалось создать папку проекта: {error}"))?;
+    fs::canonicalize(path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn browse_project_parent() -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    return Err("Создание папок проектов доступно в desktop-версии".into());
+    #[cfg(not(target_os = "android"))]
+    Ok(rfd::FileDialog::new()
+        .set_title("Выберите место для нового проекта")
+        .pick_folder()
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn activate_project(
+    app: AppHandle,
+    workspace: State<'_, WorkspaceState>,
+    path: String,
+) -> Result<String, String> {
+    let root = activate_workspace(&app, &workspace, PathBuf::from(path))?;
+    Ok(root.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -693,8 +805,7 @@ fn start_local_model(config: StartModel, state: State<Runtime>) -> Result<String
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
     let mut active = state.child.lock().map_err(|e| e.to_string())?;
     if let Some(mut child) = active.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_process_tree(&mut child)?;
     }
     let mut cmd = Command::new(&config.executable);
     cmd.args([
@@ -760,8 +871,7 @@ fn stop_local_model(state: State<Runtime>) -> Result<(), String> {
     state.generation.fetch_add(1, Ordering::SeqCst);
     let mut active = state.child.lock().map_err(|e| e.to_string())?;
     if let Some(mut child) = active.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_process_tree(&mut child)?;
     }
     Ok(())
 }
@@ -992,6 +1102,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_directory,
             browse_directory,
+            browse_project_parent,
+            create_project_directory,
+            activate_project,
             browse_gguf,
             browse_executable,
             get_workspace_root,
@@ -1036,8 +1149,7 @@ pub fn run() {
                 .ok()
                 .and_then(|mut child| child.take())
             {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = terminate_process_tree(&mut child);
             }
         }
     });
@@ -1046,11 +1158,13 @@ pub fn run() {
 #[cfg(test)]
 mod workspace_search_tests {
     use super::{
-        checked_workspace_path, git_status_for, ignored_search_directory, matching_lines,
-        search_workspace_files, validate_search_query, StartModel,
+        checked_workspace_path, create_project_path, git_status_for, ignored_search_directory,
+        matching_lines, search_workspace_files, terminate_process_tree, validate_search_query,
+        StartModel,
     };
     use std::fs;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     #[test]
     fn local_model_config_deserializes_frontend_camel_case_fields() {
@@ -1115,6 +1229,75 @@ mod workspace_search_tests {
     fn workspace_search_rejects_empty_and_excessive_queries() {
         assert!(validate_search_query("  ").is_err());
         assert!(validate_search_query(&"x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn project_creation_makes_one_child_folder_and_rejects_path_traversal() {
+        let parent = std::env::temp_dir().join(format!(
+            "flux-hands-project-create-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&parent).unwrap();
+
+        let project = create_project_path(&parent, "  Demo Project  ").unwrap();
+        assert_eq!(project.file_name().unwrap(), "Demo Project");
+        assert!(project.is_dir());
+        assert!(create_project_path(&parent, "../outside").is_err());
+        assert!(create_project_path(&parent, "bad:name").is_err());
+        assert!(create_project_path(&parent, " ").is_err());
+        assert!(!parent.parent().unwrap().join("outside").exists());
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminating_agent_wrapper_stops_its_child_processes() {
+        use std::os::windows::process::CommandExt;
+
+        let pid_file = std::env::temp_dir().join(format!(
+            "flux-hands-process-tree-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            "$child = Start-Process -PassThru -WindowStyle Hidden -FilePath $env:ComSpec -ArgumentList '/c','ping -t 127.0.0.1 > NUL'; Set-Content -NoNewline -Path '{}' -Value $child.Id; while ($true) {{ Start-Sleep -Seconds 1 }}",
+            pid_file.display()
+        );
+        let mut wrapper = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(0x08000000)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let child_pid = (0..100).find_map(|_| {
+            if let Ok(value) = fs::read_to_string(&pid_file) {
+                if let Ok(pid) = value.trim().parse::<u32>() {
+                    return Some(pid);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            None
+        });
+        let Some(child_pid) = child_pid else {
+            let _ = terminate_process_tree(&mut wrapper);
+            let _ = fs::remove_file(pid_file);
+            panic!("PowerShell did not create the child process");
+        };
+
+        terminate_process_tree(&mut wrapper).unwrap();
+        let child_check = Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {child_pid}"), "/NH"])
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        let child_listing = String::from_utf8_lossy(&child_check.stdout);
+        assert!(
+            !child_listing.contains(&child_pid.to_string()),
+            "child process {child_pid} survived process-tree termination: {child_listing}"
+        );
+        let _ = fs::remove_file(pid_file);
     }
 
     #[test]

@@ -15,8 +15,20 @@ $headers = @{
 
 $base = "https://api.github.com/repos/$repository"
 $latest = Invoke-RestMethod -Method Get -Uri "$base/releases/latest" -Headers $headers
-$releases = Invoke-RestMethod -Method Get -Uri "$base/releases?per_page=100" -Headers $headers
-$staleReleases = @($releases | Where-Object { -not $_.prerelease -and $_.id -ne $latest.id })
+$currentTag = $env:GITHUB_REF_NAME
+if (-not $currentTag) {
+    throw 'GITHUB_REF_NAME is required to preserve the release being published.'
+}
+$current = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$currentTag" -Headers $headers
+$releases = @()
+$page = 1
+do {
+    $batch = @(Invoke-RestMethod -Method Get -Uri "$base/releases?per_page=100&page=$page" -Headers $headers)
+    $releases += $batch
+    $page++
+} while ($batch.Count -eq 100)
+$keepIds = @($latest.id, $current.id)
+$staleReleases = @($releases | Where-Object { $_.id -notin $keepIds })
 $removed = 0
 
 foreach ($release in $staleReleases) {
@@ -31,4 +43,4 @@ foreach ($release in $staleReleases) {
     }
 }
 
-Write-Host "Kept latest stable release $($latest.tag_name) and all prereleases; removed $removed installer/updater assets from older stable releases."
+Write-Host "Kept current release $($current.tag_name) and latest stable release $($latest.tag_name); removed $removed installer/updater assets from older releases."
