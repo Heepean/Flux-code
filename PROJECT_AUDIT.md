@@ -1,6 +1,6 @@
 # Flux Code / Flux Hands project audit
 
-Audit snapshot: 2026-10-12, local checkout `D:\Flux code\repo-check` at `bfafbac`; `v1.0.14-beta.2` is running Actions workflow 38220704939 for earlier commit `0634555`. Flux Code and Flux Hands refer to this one project. This is a source/build and focused runtime audit, not a claim that every workflow was exercised on a clean user machine.
+Audit snapshot: 2026-10-12, local checkout `D:\Flux code\repo-check` at `90eaadd` with uncommitted Git diff, guarded file-editor rollback and interrupt support; `v1.0.14-beta.2` is running Actions workflow 38220704939 for earlier commit `0634555`. Flux Code and Flux Hands refer to this one project. This is a source/build and focused runtime audit, not a claim that every workflow was exercised on a clean user machine.
 
 ## Architecture observed
 
@@ -23,15 +23,17 @@ No embedded VS Code or OpenHands source tree is present in this checkout. The ap
 | Create and switch projects | Implemented in UI and native commands | `cargo test` covers safe child-folder creation and traversal rejection; local browser preview showed the open-existing/create-new dialog. Native folder-picker and full Tauri project-switch flow are not yet exercised |
 | Multiple chats per project | Implemented with transcript and OpenHands conversation-ID persistence | Local browser preview showed new chat creation; switching, reload restoration and independent server continuation have not yet been exercised in the desktop UI |
 | Save editor content | Explicit Save/Ctrl+S, per-tab dirty state | `npm run build` passed; native file editing/save, failed-save recovery, external changes and reload behavior remain unverified |
-| Workspace text search | Implemented in Rust; skips selected directories and large/binary files | Rust unit tests pass (9 total) |
+| Workspace text search | Implemented in Rust; skips selected directories and large/binary files | Rust unit tests pass (13 total in current working tree) |
 | Git branch/status and changed file opening | Implemented (read-only status) | Rust temp-repository test passes |
 | Local GGUF launch/switch | Implemented with CPU runtime bootstrap, RAM check and one child process | Real small GGUF loaded through native app commands; health and chat passed, then stop closed the port. Full user models are refused on this machine's available RAM |
 | Hugging Face model search/download | Implemented for desktop | Source reviewed; no network/download scenario run here |
-| OpenHands local/remote task execution | Implemented using API/event polling | Earlier dev-app E2E covered Kilo Free events and approval. A separate live OpenHands 1.26.0 run with `openai/kilo-auto/free` returned `KILO_AUTO_PROBE_OK`; persisted conversation state reached `finished` |
+| OpenHands local/remote task execution | Implemented using API/event polling; interrupt support is added in the current uncommitted tree | Earlier dev-app E2E covered Kilo Free events and approval. Interrupt endpoint path, session header, and remote/local base selection pass an HTTP mock/unit test; cancellation against a running live conversation is not yet verified |
 | Kilo free catalog | Implemented against live Kilo endpoint | Anonymous Kilo Auto Free request through OpenHands 1.26.0 returned the expected marker with zero reported model cost; tool-capable action flow and provider limits remain in scope |
 | Android remote agent flow | Implemented | 1.0.13 ARM64 debug APK built; signature and package metadata checked; no phone/emulator attached, so not installed/launched |
 | Auto-update | Configured for GitHub Releases, signed updater manifest expected | Not exercised against a published release; local Windows installers lack updater signatures |
-| Change diff, agent-action undo/rollback, terminal panel | Not implemented in UI | Confirmed by source review; editor dirty state does not provide agent-action diff/rollback |
+| Git per-file diff preview | Implemented in current uncommitted tree | Rust tests cover tracked staged/unstaged changes, untracked text files, filenames with spaces, and rejecting a sibling path outside the workspace; native panel not visually verified |
+| OpenHands file_editor rollback | Implemented in current uncommitted tree | Successful observations carry before/after state; rollback is limited to the active local workspace and only applies when current bytes still equal the recorded after-state. Unit tests cover restoration, deleting an agent-created file, preserving subsequent user edits, and rejecting outside paths. Not durable across app restart and does not undo terminal side effects or remote files |
+| Terminal panel and terminal-command rollback | Not implemented | A terminal command may have arbitrary external side effects; no safe automatic undo is claimed |
 | Android user experience | Remote-only flow implemented | APK is ARM64 debug-signed, not Play Store/release signed |
 
 ## Critical findings and risks
@@ -60,13 +62,13 @@ The UI now stores project lists and per-project chat transcripts plus OpenHands 
 
 Monaco is present with a Save button, Ctrl+S and visible dirty indicators. There is no tab/session restore, save conflict detection for external edits, navigation/search integration in the editor, diff view, or undo at agent-action level. Native edit/save flow has not yet been exercised in a desktop window.
 
-### P1 — Task lifecycle and cancellation are incomplete
+### P1 — Task lifecycle and cancellation remain incomplete
 
-The UI has one busy flag and streams event text/status, but no task list, pause/cancel action, structured approval state, or durable activity journal was found. Agent polling and server process behavior need end-to-end cancellation/exit testing.
+The current working tree adds a stop button and calls OpenHands 1.26.0 `POST /api/conversations/{id}/interrupt` for local and remote servers. HTTP mock coverage verifies the route and session header, and terminal `paused` state is surfaced as user cancellation. A running-agent cancellation scenario has not yet been exercised end to end. The runtime isolation gap also remains: native file commands enforce the selected root, but OpenHands LocalWorkspace and terminal run directly as the desktop user. Task list, structured durable activity/approval journal, and restart recovery remain missing.
 
 ### P1 — Release maturity differs by platform
 
-The GitHub workflow creates signed Windows updater assets and an ARM64 debug APK. Public stable v1.0.8 currently reports six release assets; the public page does not expose their names in this audit. Candidate v1.0.14-beta.2 (workflow 38220704939) is still in progress and currently has only the two GitHub source archives. Its Android job runs after the Windows release job. The previous Android job failed during SDK setup. Local Windows NSIS/MSI builds and APK are unsigned/debug-signed respectively; neither has been installed and smoke-tested on a clean Windows PC or Android device.
+The GitHub workflow creates signed Windows updater assets and an ARM64 debug APK. Public stable v1.0.8 currently reports six release assets; the public page does not expose their names in this audit. Candidate v1.0.14-beta.2 (workflow 38220704939) still reports In progress and no workflow artifacts in the public Actions page; stable v1.0.8 remains the newest listed release. The candidate does not contain later source commits or the current uncommitted changes. Its Android job runs after the Windows release job. The previous Android job failed during SDK setup. Local Windows NSIS/MSI builds and APK are unsigned/debug-signed respectively; neither has been installed and smoke-tested on a clean Windows PC or Android device.
 
 ### P1 — Product says “no account/no limits” only within provider constraints
 
@@ -75,7 +77,7 @@ Local inference needs hardware/runtime; Kilo's anonymous free tier has upstream 
 ## Build and repository state
 
 - `npm run build`: passed on 2026-10-12 (TypeScript compile and Vite production build).
-- `cargo test --manifest-path src-tauri/Cargo.toml`: passed 11 tests on 2026-10-12, including Windows child-process-tree termination and project-folder traversal rejection.
+- `cargo test --manifest-path src-tauri/Cargo.toml`: passed 15 tests in the current working tree on 2026-10-12, including Windows child-process-tree termination, project-folder traversal rejection, mocked OpenHands interrupt routing, and Git diff stage/scope cases.
 - Latest `npm run build`, `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo fmt --check`, and `git diff --check` passed on 2026-10-12.
 - `npm run build`: passed after the local model command fix.
 - Windows NSIS (3,815,192 bytes) and MSI (5,677,056 bytes) v1.0.13 installers built locally. Tauri updater signing failed because the private signing key is only available in GitHub Actions; no local Authenticode signature was established.
@@ -87,7 +89,7 @@ Local inference needs hardware/runtime; Kilo's anonymous free tier has upstream 
 - Process-tree regression: a Windows test launched a wrapper and child process, ran `terminate_process_tree`, verified the child PID exited, and passed; the production Agent Server path uses this helper.
 - New project/chat UI was checked in a local browser preview; Tauri native folder dialogs and desktop persistence remain unverified.
 - This OpenHands startup produced a non-fatal browser tool preload error (`Server.list_tools` missing); server reached ready state and the no-tools response succeeded. Browser automation tools may be unavailable until the upstream dependency mismatch is resolved.
-- Workflow 38220704939 for v1.0.14-beta.2 was still in progress at this audit; stable v1.0.8 public release page reports six assets. Verify exact asset names, hashes and Android APK after workflow completion.
+- Public Actions page still reports workflow 38220704939 for v1.0.14-beta.2 as In progress with no workflow artifacts; GitHub Releases still lists v1.0.8 as newest with six assets. The beta has not produced a verified installer or APK.
 - Clean-machine installed-app smoke test: not performed.
 
 ## Immediate implementation order
@@ -95,7 +97,7 @@ Local inference needs hardware/runtime; Kilo's anonymous free tier has upstream 
 1. Exercise approval and rejection with a live OpenHands 1.26 test server; verify that no action runs before approval and rejected runs visibly stop.
 2. Publish a CI run with separated Android license and SDK installation steps; finish APK build and verify release assets.
 3. Add Windows junction/root-switch race coverage to the selected-workspace boundary; establish and test the OpenHands runtime's actual containment.
-4. Add task stop/cancel behavior and durable event/transcript state; test process cleanup on app exit and failure.
+4. Run the new stop flow against a live running OpenHands 1.26.0 task; then add durable event/transcript state and test cleanup on app exit and failure.
 5. Implement agent change preview (diff) and rollback based on recorded file state.
 6. Run repeatable integration scenarios for local/remote OpenHands, provider switching, and Android remote connection.
 7. Complete editor/session persistence and external file change handling.

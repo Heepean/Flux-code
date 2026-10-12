@@ -743,6 +743,128 @@ fn git_status_for(path: &Path) -> Result<GitStatus, String> {
     Ok(GitStatus { branch, changes })
 }
 
+#[derive(Serialize)]
+struct GitFileDiff {
+    path: String,
+    diff: String,
+    staged: bool,
+}
+
+#[tauri::command]
+fn git_file_diff(
+    workspace: State<'_, WorkspaceState>,
+    path: String,
+) -> Result<GitFileDiff, String> {
+    git_file_diff_for(&workspace.active_root()?, &path)
+}
+
+fn git_file_diff_for(root: &Path, path: &str) -> Result<GitFileDiff, String> {
+    let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let target = checked_workspace_path(&root, path)?;
+    if !target.is_file() {
+        return Err("Изменённый путь не является доступным файлом".into());
+    }
+    let relative = target
+        .strip_prefix(&root)
+        .map_err(|_| "Файл находится вне проекта")?;
+    let relative = relative.to_str().ok_or("Путь файла не является UTF-8")?;
+    let status = git_output(
+        root.to_str().ok_or("Путь проекта не является UTF-8")?,
+        &["status", "--porcelain=v1", "--", relative],
+    )?;
+    if !status.status.success() {
+        return Err("Не удалось получить Git-статус файла".into());
+    }
+    let code = String::from_utf8_lossy(&status.stdout)
+        .chars()
+        .take(2)
+        .collect::<String>();
+    if code.is_empty() {
+        return Err("Файл больше не содержит Git-изменений".into());
+    }
+    let staged = code
+        .chars()
+        .next()
+        .is_some_and(|value| value != ' ' && value != '?');
+    let diff = if code.starts_with("??") {
+        let bytes = fs::read(&target).map_err(|error| error.to_string())?;
+        if bytes.len() > 1_000_000 || bytes.contains(&0) {
+            return Err(
+                "Предпросмотр untracked доступен только для текстовых файлов до 1 МБ".into(),
+            );
+        }
+        let content = String::from_utf8(bytes).map_err(|_| "Файл не является UTF-8 текстом")?;
+        let mut diff = format!("--- /dev/null\n+++ b/{relative}\n");
+        for line in content.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        if content.is_empty() {
+            diff.push_str("@@ пустой файл @@\n");
+        }
+        diff
+    } else {
+        let pathspec = format!(":(top,literal){relative}");
+        let root = root.to_str().ok_or("Путь проекта не является UTF-8")?;
+        let mut diff = String::new();
+        if code.chars().any(|value| value != ' ' && value != '?') {
+            let staged_output = git_output(
+                root,
+                &[
+                    "diff",
+                    "--cached",
+                    "--no-ext-diff",
+                    "--no-color",
+                    "--",
+                    &pathspec,
+                ],
+            )?;
+            if !staged_output.status.success() {
+                return Err(format!(
+                    "Git staged diff завершился с ошибкой: {}",
+                    String::from_utf8_lossy(&staged_output.stderr).trim()
+                ));
+            }
+            if !staged_output.stdout.is_empty() {
+                diff.push_str("# Индексированные изменения\n");
+                diff.push_str(&String::from_utf8_lossy(&staged_output.stdout));
+            }
+        }
+        if code
+            .chars()
+            .any(|value| value == ' ' || value == 'M' || value == 'D' || value == 'A')
+        {
+            let output = git_output(
+                root,
+                &["diff", "--no-ext-diff", "--no-color", "--", &pathspec],
+            )?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Git diff завершился с ошибкой: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            if !output.stdout.is_empty() {
+                if !diff.is_empty() {
+                    diff.push('\n');
+                }
+                diff.push_str("# Незастейдженные изменения\n");
+                diff.push_str(&String::from_utf8_lossy(&output.stdout));
+            }
+        }
+        if diff.is_empty() {
+            return Err("Для файла нет текстового diff (возможно, он бинарный)".into());
+        }
+        diff
+    };
+    Ok(GitFileDiff {
+        path: target.to_string_lossy().into_owned(),
+        diff,
+        staged,
+    })
+}
+
 #[tauri::command]
 fn read_text_file(workspace: State<'_, WorkspaceState>, path: String) -> Result<String, String> {
     let root = workspace.active_root()?;
@@ -765,6 +887,52 @@ fn write_text_file(
         return Err("Можно сохранять только существующие файлы проекта".into());
     }
     std::fs::write(path, content).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentFileRollback {
+    path: String,
+    before: Option<String>,
+    after: String,
+    existed_before: bool,
+}
+
+#[tauri::command]
+fn rollback_agent_file_change(
+    workspace: State<'_, WorkspaceState>,
+    change: AgentFileRollback,
+) -> Result<(), String> {
+    rollback_agent_file_change_for(&workspace.active_root()?, &change)
+}
+
+fn rollback_agent_file_change_for(root: &Path, change: &AgentFileRollback) -> Result<(), String> {
+    if !change.existed_before && change.before.is_some() {
+        return Err("Журнал изменения файла некорректен".into());
+    }
+    if change.existed_before && change.before.is_none() {
+        return Err("Для восстановления файла отсутствует исходное содержимое".into());
+    }
+    let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let target = checked_workspace_path(&root, &change.path)?;
+    if !target.is_file() {
+        return Err("Файл больше не существует; безопасный откат невозможен".into());
+    }
+    let current = fs::read_to_string(&target)
+        .map_err(|error| format!("Невозможно проверить файл перед откатом: {error}"))?;
+    if current != change.after {
+        return Err("Файл изменился после действия агента. Сначала проверьте текущий diff.".into());
+    }
+    if change.existed_before {
+        fs::write(
+            target,
+            change.before.as_deref().expect("validated before content"),
+        )
+        .map_err(|error| format!("Не удалось восстановить файл: {error}"))
+    } else {
+        fs::remove_file(target)
+            .map_err(|error| format!("Не удалось удалить созданный агентом файл: {error}"))
+    }
 }
 
 #[tauri::command]
@@ -1114,8 +1282,10 @@ pub fn run() {
             scan_models,
             search_workspace,
             git_status,
+            git_file_diff,
             read_text_file,
             write_text_file,
+            rollback_agent_file_change,
             start_local_model,
             stop_local_model,
             fetch_huggingface,
@@ -1127,6 +1297,7 @@ pub fn run() {
             openhands::stop_agent_server,
             openhands::get_agent_server_status,
             openhands::send_agent_message,
+            openhands::interrupt_agent_conversation,
             openhands::respond_to_agent_confirmation,
             openhands::save_model_provider_key,
             openhands::remove_model_provider_key,
@@ -1158,8 +1329,9 @@ pub fn run() {
 #[cfg(test)]
 mod workspace_search_tests {
     use super::{
-        checked_workspace_path, create_project_path, git_status_for, ignored_search_directory,
-        matching_lines, search_workspace_files, terminate_process_tree, validate_search_query,
+        checked_workspace_path, create_project_path, git_file_diff_for, git_status_for,
+        ignored_search_directory, matching_lines, rollback_agent_file_change_for,
+        search_workspace_files, terminate_process_tree, validate_search_query, AgentFileRollback,
         StartModel,
     };
     use std::fs;
@@ -1388,5 +1560,102 @@ mod workspace_search_tests {
             .any(|change| change.code == "??" && change.path.ends_with("new file.txt")));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_diff_previews_tracked_and_untracked_text_files_inside_project() {
+        let root =
+            std::env::temp_dir().join(format!("flux-hands-git-diff-{}", uuid::Uuid::new_v4()));
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "secret").unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init", "-b", "test-branch"]).status.success());
+        assert!(
+            run(&["config", "user.email", "flux-hands-test@example.invalid"])
+                .status
+                .success()
+        );
+        assert!(run(&["config", "user.name", "Flux Hands Test"])
+            .status
+            .success());
+        let tracked = root.join("tracked.txt");
+        fs::write(&tracked, "before\n").unwrap();
+        assert!(run(&["add", "tracked.txt"]).status.success());
+        assert!(run(&["commit", "-m", "initial"]).status.success());
+        fs::write(&tracked, "staged\n").unwrap();
+        assert!(run(&["add", "tracked.txt"]).status.success());
+        fs::write(&tracked, "after\n").unwrap();
+        let added = root.join("new file.txt");
+        fs::write(&added, "new line\n").unwrap();
+
+        let tracked_diff = git_file_diff_for(&root, &tracked.to_string_lossy()).unwrap();
+        assert!(tracked_diff.diff.contains("# Индексированные изменения"));
+        assert!(tracked_diff.diff.contains("-before"));
+        assert!(tracked_diff.diff.contains("+staged"));
+        assert!(tracked_diff.diff.contains("# Незастейдженные изменения"));
+        assert!(tracked_diff.diff.contains("-before"));
+        assert!(tracked_diff.diff.contains("+after"));
+        let added_diff = git_file_diff_for(&root, &added.to_string_lossy()).unwrap();
+        assert!(added_diff.diff.contains("+new line"));
+        assert!(git_file_diff_for(&root, &outside.to_string_lossy()).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn agent_file_rollback_restores_only_unchanged_workspace_files() {
+        let parent =
+            std::env::temp_dir().join(format!("flux-hands-rollback-{}", uuid::Uuid::new_v4()));
+        let root = parent.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let edited = root.join("edited.txt");
+        fs::write(&edited, "agent version").unwrap();
+        let change = AgentFileRollback {
+            path: edited.to_string_lossy().into_owned(),
+            before: Some("original".into()),
+            after: "agent version".into(),
+            existed_before: true,
+        };
+        rollback_agent_file_change_for(&root, &change).unwrap();
+        assert_eq!(fs::read_to_string(&edited).unwrap(), "original");
+
+        let created = root.join("created.txt");
+        fs::write(&created, "created by agent").unwrap();
+        let create_change = AgentFileRollback {
+            path: created.to_string_lossy().into_owned(),
+            before: None,
+            after: "created by agent".into(),
+            existed_before: false,
+        };
+        rollback_agent_file_change_for(&root, &create_change).unwrap();
+        assert!(!created.exists());
+
+        fs::write(&edited, "user edits after agent").unwrap();
+        assert!(rollback_agent_file_change_for(&root, &change).is_err());
+        assert_eq!(
+            fs::read_to_string(&edited).unwrap(),
+            "user edits after agent"
+        );
+        let outside = parent.join("outside.txt");
+        fs::write(&outside, "do not touch").unwrap();
+        let outside_change = AgentFileRollback {
+            path: outside.to_string_lossy().into_owned(),
+            before: Some("secret".into()),
+            after: "do not touch".into(),
+            existed_before: true,
+        };
+        assert!(rollback_agent_file_change_for(&root, &outside_change).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "do not touch");
+
+        fs::remove_dir_all(parent).unwrap();
     }
 }

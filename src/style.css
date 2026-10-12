@@ -81,6 +81,24 @@
 .git-branch-card{display:flex;align-items:center;gap:10px;max-width:760px;padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--accent)}
 .git-branch-card span{margin-left:auto;color:var(--muted);font-size:12px}
 .git-change-list{display:flex;flex-direction:column;gap:4px;max-width:900px;margin-top:16px}
+.git-change-row{display:flex;align-items:center;gap:8px}
+.git-change-row .git-change{flex:1;min-width:0}
+.git-diff-button{padding:6px 10px;border:1px solid var(--line);border-radius:5px;color:var(--accent);font-size:11px}
+.git-diff-button:hover{background:var(--panel)}
+.git-diff-panel{max-width:1100px;margin-top:18px;border:1px solid var(--line);border-radius:8px;background:var(--panel);overflow:hidden}
+.git-diff-panel header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-bottom:1px solid var(--line)}
+.git-diff-panel header div{display:flex;flex-direction:column;gap:4px;min-width:0}
+.git-diff-panel header b,.git-diff-panel header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.git-diff-panel header span,.git-diff-error{color:var(--muted);font-size:11px}
+.git-diff-panel pre{max-height:55vh;overflow:auto;margin:0;padding:12px;color:var(--text);font:12px/1.55 'Cascadia Code',Consolas,monospace;white-space:pre}
+.git-diff-error{margin-top:12px}
+.agent-changes{width:min(900px,calc(100% - 48px));margin:0 auto 12px;border:1px solid var(--line);border-radius:7px;background:var(--panel);overflow:hidden}
+.agent-changes>header,.agent-change{display:flex;align-items:center;gap:10px;padding:9px 12px}
+.agent-changes>header{flex-direction:column;align-items:flex-start;border-bottom:1px solid var(--line)}
+.agent-changes>header span,.agent-change>span{color:var(--muted);font-size:10px}
+.agent-change{border-bottom:1px solid var(--line)}
+.agent-change:last-child{border-bottom:0}
+.agent-change code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font:11px 'Cascadia Code',Consolas,monospace}
 .git-change{display:flex;align-items:center;gap:12px;min-height:38px;padding:7px 10px;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--text);text-align:left;cursor:pointer}
 .git-change:hover{border-color:var(--line);background:var(--panel)}
 .git-change-code{width:28px;color:var(--accent);font:12px 'Cascadia Code',monospace}

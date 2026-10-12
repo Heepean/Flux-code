@@ -56,6 +56,8 @@ struct AgentEvent {
     status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_approvals: Option<Vec<PendingApproval>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_changes: Option<Vec<AgentFileChange>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -63,6 +65,15 @@ struct PendingApproval {
     tool_name: String,
     security_risk: String,
     action: serde_json::Value,
+}
+
+#[derive(Serialize, Clone)]
+struct AgentFileChange {
+    id: String,
+    path: String,
+    before: Option<String>,
+    after: String,
+    existed_before: bool,
 }
 
 #[derive(Deserialize)]
@@ -925,13 +936,16 @@ pub async fn send_agent_message(
             error: None,
             status: None,
             pending_approvals: None,
+            file_changes: None,
         },
     );
     let mut answer = String::new();
     let mut final_status = String::new();
+    let mut was_interrupted = false;
     let mut action_rejected = false;
     let mut assistant_messages = std::collections::HashSet::new();
     let mut pending_actions = std::collections::BTreeMap::<String, PendingApproval>::new();
+    let mut file_changes = Vec::<AgentFileChange>::new();
     let mut approval_prompt_emitted = false;
     for _ in 0..600 {
         let mut new_events = Vec::new();
@@ -1030,6 +1044,7 @@ pub async fn send_agent_message(
                             error: None,
                             status: None,
                             pending_approvals: None,
+                            file_changes: None,
                         },
                     );
                 }
@@ -1067,10 +1082,52 @@ pub async fn send_agent_message(
                         error: None,
                         status: None,
                         pending_approvals: None,
+                        file_changes: None,
                     },
                 );
             }
             if kind == "ObservationEvent" {
+                if event.get("tool_name").and_then(serde_json::Value::as_str) == Some("file_editor")
+                {
+                    if let Some(observation) = event.get("observation") {
+                        let succeeded = observation
+                            .get("is_error")
+                            .and_then(serde_json::Value::as_bool)
+                            != Some(true);
+                        let path = observation.get("path").and_then(serde_json::Value::as_str);
+                        let before = observation
+                            .get("old_content")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned);
+                        let after = observation
+                            .get("new_content")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned);
+                        let existed_before = observation
+                            .get("prev_exist")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(true);
+                        if succeeded {
+                            if let (Some(action_id), Some(path), Some(after)) = (
+                                event.get("action_id").and_then(serde_json::Value::as_str),
+                                path,
+                                after,
+                            ) {
+                                if (existed_before && before.is_some())
+                                    || (!existed_before && before.is_none())
+                                {
+                                    file_changes.push(AgentFileChange {
+                                        id: action_id.to_owned(),
+                                        path: path.to_owned(),
+                                        before,
+                                        after,
+                                        existed_before,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(action_id) = event.get("action_id").and_then(serde_json::Value::as_str)
                 {
                     pending_actions.remove(action_id);
@@ -1098,6 +1155,7 @@ pub async fn send_agent_message(
                             error: None,
                             status: None,
                             pending_approvals: None,
+                            file_changes: Some(file_changes.clone()),
                         },
                     );
                 }
@@ -1117,12 +1175,14 @@ pub async fn send_agent_message(
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default()
                         .to_owned();
+                    was_interrupted |= final_status == "paused";
                 } else if key == Some("full_state") {
                     final_status = event
                         .pointer("/value/execution_status")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default()
                         .to_owned();
+                    was_interrupted |= final_status == "paused";
                 }
             }
             if kind == "ConversationErrorEvent"
@@ -1154,6 +1214,7 @@ pub async fn send_agent_message(
                     error: None,
                     status: None,
                     pending_approvals: Some(approvals),
+                    file_changes: None,
                 },
             );
             approval_prompt_emitted = true;
@@ -1170,11 +1231,15 @@ pub async fn send_agent_message(
     }
     let completion_status = if action_rejected {
         "Действие отклонено · выполнение остановлено"
+    } else if was_interrupted {
+        "Задача остановлена · разговор можно продолжить"
     } else {
         "Готово"
     };
     let completion_message = if action_rejected {
         "\n\nДействие отклонено. Агент остановлен; отправьте новое сообщение, чтобы продолжить задачу."
+    } else if was_interrupted {
+        "\n\nЗадача остановлена по запросу пользователя. Отправьте новое сообщение, чтобы продолжить разговор."
     } else {
         ""
     };
@@ -1188,6 +1253,7 @@ pub async fn send_agent_message(
             error: None,
             status: Some(completion_status.to_owned()),
             pending_approvals: None,
+            file_changes: Some(file_changes),
         },
     );
     if answer.trim().is_empty() {
@@ -1247,6 +1313,54 @@ pub async fn respond_to_agent_confirmation(
     ensure_success(response, "OpenHands не принял решение по действию").await
 }
 
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn interrupt_agent_conversation(
+    state: State<'_, AgentServerState>,
+    conversationId: String,
+) -> Result<(), String> {
+    let conversation_id = Uuid::parse_str(&conversationId)
+        .map_err(|_| "ID разговора OpenHands имеет неверный формат".to_owned())?;
+    let (base, key) = agent_connection(state.inner())?;
+    interrupt_conversation(&base, &key, conversation_id).await
+}
+
+fn agent_connection(state: &AgentServerState) -> Result<(String, String), String> {
+    let port = state.port.lock().map_err(|error| error.to_string())?;
+    let remote_base = state
+        .remote_base
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let key = state
+        .session_key
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone()
+        .ok_or("OpenHands session key is missing")?;
+    let base = match remote_base {
+        Some(base) => base,
+        None => format!(
+            "http://127.0.0.1:{}",
+            port.ok_or("OpenHands Agent Server is not running")?
+        ),
+    };
+    Ok((base, key))
+}
+
+async fn interrupt_conversation(base: &str, key: &str, id: Uuid) -> Result<(), String> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!("{base}/api/conversations/{id}/interrupt"))
+        .header("X-Session-API-Key", key)
+        .send()
+        .await
+        .map_err(|error| format!("Не удалось прервать задачу OpenHands: {error}"))?;
+    ensure_success(response, "OpenHands не прервал задачу").await
+}
+
 async fn ensure_success(response: reqwest::Response, context: &str) -> Result<(), String> {
     if response.status().is_success() {
         return Ok(());
@@ -1276,10 +1390,59 @@ async fn ensure_success_json(
 #[cfg(test)]
 mod tests {
     use super::{
-        kilo_model_is_free_text, reuse_or_stop_existing_agent, status, AgentConfig,
-        AgentServerState,
+        agent_connection, interrupt_conversation, kilo_model_is_free_text,
+        reuse_or_stop_existing_agent, status, AgentConfig, AgentServerState,
     };
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn interrupt_uses_the_openhands_route_and_session_key() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        tauri::async_runtime::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(request.starts_with(&format!(
+                    "POST /api/conversations/{}/interrupt HTTP/1.1",
+                    uuid::Uuid::nil()
+                )));
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("x-session-api-key: test-session"));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            });
+
+            interrupt_conversation(
+                &format!("http://{address}"),
+                "test-session",
+                uuid::Uuid::nil(),
+            )
+            .await
+            .unwrap();
+            server.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn agent_connection_prefers_configured_remote_server() {
+        let state = AgentServerState::default();
+        *state.remote_base.lock().unwrap() = Some("http://agent.example".into());
+        *state.session_key.lock().unwrap() = Some("session".into());
+
+        assert_eq!(
+            agent_connection(&state).unwrap(),
+            ("http://agent.example".into(), "session".into())
+        );
+    }
 
     #[cfg(windows)]
     #[test]
