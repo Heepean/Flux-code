@@ -123,3 +123,10 @@ This audit reviewed source, CI/release status and artifacts, ran a real small-GG
 - Project switching now holds a frontend lock until the new root, file listing and model scan finish loading; sending a task, switching chats or starting another switch is rejected while that transition is active. Folder selection and project-folder creation return a path without changing native active-workspace state; the common switch routine performs activation.
 - `npm run build`, `cargo fmt --check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, and `git diff --check` passed; the Rust suite now has 16 passing tests.
 - The lock is a frontend coordination rule, not an OS security boundary. It has not yet been exercised in the native desktop window while a live Agent Server task runs, and direct Tauri IPC calls are not independently guarded. OpenHands' local runtime and terminal still run with the user's Windows permissions.
+
+## Follow-up verification — live OpenHands cancellation — 2026-10-12
+
+- Started the pinned OpenHands Agent Server 1.26.0 with Kilo Free in a disposable workspace under `%TEMP%`. The model proposed exactly one terminal action: a 45-second Python sleep followed by a marker print. The pending action was inspected and approved.
+- Sent `POST /api/conversations/{id}/interrupt` with the session API key while the action was running. OpenHands returned HTTP 200, emitted `InterruptEvent`, recorded `execution_status=paused`, and emitted `AgentErrorEvent` with `Tool call interrupted before completion. The conversation was paused.` No Python process for the sleep remained, and the marker was not printed.
+- The Agent Server process was stopped and port 51265 was confirmed closed. This verifies the pinned server's live route and process cancellation, not the Tauri button-to-command/event path or Android remote cancellation.
+- The temporary test directory remains at `C:\Users\Admin\AppData\Local\Temp\flux-hands-live-cancel-368653b52eaf4315afcbce2127c76044`; recursive removal was blocked by the execution policy. It contains only the isolated test workspace and OpenHands persistence from this probe.
