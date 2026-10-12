@@ -16,8 +16,9 @@ Build a dependable Windows desktop workspace for projects, local GGUF models, re
 
 ## Current verified baseline (2026-10-12)
 
-- On 2026-10-12, the production frontend build, Rust formatting check, and all 15 Rust unit tests passed on local commit `e3806cf`.
+- On 2026-10-12, the production frontend build, Rust formatting check, and all 16 Rust unit tests passed on the current local source.
 - A temporary GGUF model ran through the native llama.cpp process manager, answered a completion, and shut down. Larger user models still depend on available RAM/VRAM.
+- Windows file-boundary tests now create an NTFS junction from inside the project to an outside folder and verify the escaped path is rejected; project-switch/task-send overlap is serialized in the UI, but the live desktop race scenario remains unverified.
 - The app started OpenHands Agent Server 1.26.0 in a disposable workspace and completed a Kilo Free text task, including streamed UI events and clean server shutdown. A live `file_editor.create` action was displayed before execution: rejection kept the file absent, approval created the requested file, and the same conversation resumed after server restart.
 - That OpenHands startup logged a non-fatal browser-tool preload error (`Server.list_tools` missing); text tasks worked. A prior live dev-app scenario verified file-editor approval/rejection and conversation continuation; runtime workspace containment remains unverified.
 - A direct pinned OpenHands 1.26.0 request using the app's `openai/kilo-auto/free` model ID returned the expected Kilo response and finished; the full native UI flow still needs a desktop-window smoke test.

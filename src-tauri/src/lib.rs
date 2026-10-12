@@ -192,13 +192,9 @@ fn available_physical_memory() -> Result<u64, String> {
 }
 
 #[tauri::command]
-fn browse_directory(
-    app: AppHandle,
-    workspace: State<'_, WorkspaceState>,
-) -> Result<Option<String>, String> {
+fn browse_directory() -> Result<Option<String>, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app, workspace);
         return Err(
             "Выбор папки доступен на desktop; на Android укажите workspace на удалённом Agent Server"
                 .into(),
@@ -206,31 +202,22 @@ fn browse_directory(
     }
     #[cfg(not(target_os = "android"))]
     {
-        let selected = rfd::FileDialog::new()
+        Ok(rfd::FileDialog::new()
             .pick_folder()
-            .map(|path| activate_workspace(&app, &workspace, path))
-            .transpose()?;
-        Ok(selected.map(|path| path.to_string_lossy().into_owned()))
+            .map(|path| path.to_string_lossy().into_owned()))
     }
 }
 
 #[tauri::command]
-fn create_project_directory(
-    app: AppHandle,
-    workspace: State<'_, WorkspaceState>,
-    parent: String,
-    name: String,
-) -> Result<String, String> {
+fn create_project_directory(parent: String, name: String) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app, workspace, parent, name);
+        let _ = (parent, name);
         return Err("Создание папок проектов доступно в desktop-версии".into());
     }
     #[cfg(not(target_os = "android"))]
     {
         let path = create_project_path(Path::new(&parent), &name)?;
-        workspace.set_root(path.clone())?;
-        persist_workspace(&app, &path)?;
         Ok(path.to_string_lossy().into_owned())
     }
 }
@@ -1517,6 +1504,44 @@ mod workspace_search_tests {
         assert!(checked_workspace_path(&root, &link.to_string_lossy()).is_err());
         assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
 
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_commands_reject_junctions_that_escape_the_workspace() {
+        let parent =
+            std::env::temp_dir().join(format!("flux-hands-junction-{}", uuid::Uuid::new_v4()));
+        let root = parent.join("project");
+        let outside = parent.join("outside");
+        let junction = root.join("linked");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        fs::write(&secret, "secret").unwrap();
+
+        let command = format!(
+            "/C mklink /J \"{}\" \"{}\"",
+            junction.display(),
+            outside.display()
+        );
+        use std::os::windows::process::CommandExt;
+        let output = Command::new("cmd.exe")
+            .raw_arg(command)
+            .output()
+            .expect("Windows cmd.exe must be available to create a test junction");
+        assert!(
+            output.status.success(),
+            "failed to create junction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let escaped_file = junction.join("secret.txt");
+        assert!(checked_workspace_path(&canonical_root, &escaped_file.to_string_lossy()).is_err());
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "secret");
+
+        fs::remove_dir(&junction).unwrap();
         fs::remove_dir_all(parent).unwrap();
     }
 
