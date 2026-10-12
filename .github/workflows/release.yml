@@ -165,8 +165,8 @@ jobs:
           yes | sdkmanager --licenses
       - name: Install Android platform tools
         run: sdkmanager --install --sdk_root="$ANDROID_HOME" 'platform-tools'
-      - name: Install Android API 37 and build tools
-        run: sdkmanager --install --sdk_root="$ANDROID_HOME" 'platforms;android-37' 'build-tools;36.0.0'
+      - name: Install Android API 37.0 and build tools
+        run: sdkmanager --install --sdk_root="$ANDROID_HOME" 'platforms;android-37.0' 'build-tools;36.0.0'
       - name: Install Android NDK
         run: |
           sdkmanager --install --sdk_root="$ANDROID_HOME" 'ndk;27.2.12479018'

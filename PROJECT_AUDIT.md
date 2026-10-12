@@ -146,3 +146,9 @@ This audit reviewed source, CI/release status and artifacts, ran a real small-GG
 - Signed the optimized APK with this machine's Android debug keystore. `apksigner verify`, `zipalign -c`, and `aapt dump badging` passed. The APK's native library SHA-256 matches Gradle's stripped release-library output.
 - Current artifact: `artifacts/Flux.Hands_1.0.15-beta.1_android-arm64.apk`, 17,150,827 bytes; package `dev.fluxcode.fluxhands`, version `1.0.15`, versionCode `1001015`, minSdk `35`, targetSdk `37`; SHA-256 `134956B97587DAF3DDCCB4E5B339E9E1A1DB3849BF88E68763E40F0055E3A370`.
 - `adb devices -l` reports no connected device or emulator. Installation, first launch, remote Agent Server setup and a real Android task are therefore still unverified. This locally debug-signed APK is for testing and is not a production-signed public release.
+
+## Follow-up verification — Android CI SDK package ID — 2026-10-12
+
+- Pushed commit `018e34a` and tag `v1.0.15-beta.1`; hosted run `38227227774` executed the new draft-gated workflow. `prepare_release` passed and created a draft; Android setup v4, license acceptance and platform-tools installation passed. Android then failed at the requested SDK platform install before NDK/build/upload. The draft gate kept it unpublished.
+- Queried the installed Android SDK Manager package catalog: there is no `platforms;android-37` package ID. The available matching platform IDs are `platforms;android-37.0`, `.1`, and `.2`; the project uses compileSdk/targetSdk 37 and this workstation builds against 37.0. Updated the workflow to install `platforms;android-37.0`.
+- The corrected workflow has not yet run in GitHub Actions. Windows release job from run `38227227774` was still in progress at this check; inspect that run before starting a replacement run or claiming Windows success.
