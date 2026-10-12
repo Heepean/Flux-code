@@ -1,6 +1,6 @@
 # Flux Code / Flux Hands project audit
 
-Audit snapshot: 2026-10-12, local checkout `D:\Flux code\repo-check` at `90eaadd` with uncommitted Git diff, guarded file-editor rollback and interrupt support; `v1.0.14-beta.2` is running Actions workflow 38220704939 for earlier commit `0634555`. Flux Code and Flux Hands refer to this one project. This is a source/build and focused runtime audit, not a claim that every workflow was exercised on a clean user machine.
+Audit snapshot: 2026-10-12, local checkout `D:\Flux code\repo-check` at `f0fb1ad` with a clean worktree; `v1.0.14-beta.2` is running Actions workflow 38220704939 for earlier commit `0634555`. Flux Code and Flux Hands refer to this one project. This is a source/build and focused runtime audit, not a claim that every workflow was exercised on a clean user machine.
 
 ## Architecture observed
 
@@ -23,16 +23,16 @@ No embedded VS Code or OpenHands source tree is present in this checkout. The ap
 | Create and switch projects | Implemented in UI and native commands | `cargo test` covers safe child-folder creation and traversal rejection; local browser preview showed the open-existing/create-new dialog. Native folder-picker and full Tauri project-switch flow are not yet exercised |
 | Multiple chats per project | Implemented with transcript and OpenHands conversation-ID persistence | Local browser preview showed new chat creation; switching, reload restoration and independent server continuation have not yet been exercised in the desktop UI |
 | Save editor content | Explicit Save/Ctrl+S, per-tab dirty state | `npm run build` passed; native file editing/save, failed-save recovery, external changes and reload behavior remain unverified |
-| Workspace text search | Implemented in Rust; skips selected directories and large/binary files | Rust unit tests pass (13 total in current working tree) |
+| Workspace text search | Implemented in Rust; skips selected directories and large/binary files | Rust unit tests pass (15 total at `f0fb1ad`) |
 | Git branch/status and changed file opening | Implemented (read-only status) | Rust temp-repository test passes |
 | Local GGUF launch/switch | Implemented with CPU runtime bootstrap, RAM check and one child process | Real small GGUF loaded through native app commands; health and chat passed, then stop closed the port. Full user models are refused on this machine's available RAM |
 | Hugging Face model search/download | Implemented for desktop | Source reviewed; no network/download scenario run here |
-| OpenHands local/remote task execution | Implemented using API/event polling; interrupt support is added in the current uncommitted tree | Earlier dev-app E2E covered Kilo Free events and approval. Interrupt endpoint path, session header, and remote/local base selection pass an HTTP mock/unit test; cancellation against a running live conversation is not yet verified |
+| OpenHands local/remote task execution | Implemented using API/event polling; interrupt support is included in `f0fb1ad` | Earlier dev-app E2E covered Kilo Free events and approval. Interrupt endpoint path, session header, and remote/local base selection pass an HTTP mock/unit test; cancellation against a running live conversation is not yet verified |
 | Kilo free catalog | Implemented against live Kilo endpoint | Anonymous Kilo Auto Free request through OpenHands 1.26.0 returned the expected marker with zero reported model cost; tool-capable action flow and provider limits remain in scope |
 | Android remote agent flow | Implemented | 1.0.13 ARM64 debug APK built; signature and package metadata checked; no phone/emulator attached, so not installed/launched |
 | Auto-update | Configured for GitHub Releases, signed updater manifest expected | Not exercised against a published release; local Windows installers lack updater signatures |
-| Git per-file diff preview | Implemented in current uncommitted tree | Rust tests cover tracked staged/unstaged changes, untracked text files, filenames with spaces, and rejecting a sibling path outside the workspace; native panel not visually verified |
-| OpenHands file_editor rollback | Implemented in current uncommitted tree | Successful observations carry before/after state; rollback is limited to the active local workspace and only applies when current bytes still equal the recorded after-state. Unit tests cover restoration, deleting an agent-created file, preserving subsequent user edits, and rejecting outside paths. Not durable across app restart and does not undo terminal side effects or remote files |
+| Git per-file diff preview | Implemented in `f0fb1ad` | Rust tests cover tracked staged/unstaged changes, untracked text files, filenames with spaces, and rejecting a sibling path outside the workspace; native panel not visually verified |
+| OpenHands file_editor rollback | Implemented in `f0fb1ad` | Successful observations carry before/after state; rollback is limited to the active local workspace and only applies when current bytes still equal the recorded after-state. Unit tests cover restoration, deleting an agent-created file, preserving subsequent user edits, and rejecting outside paths. Currently persisted only with the chat transcript in app local storage; does not undo terminal side effects or remote files |
 | Terminal panel and terminal-command rollback | Not implemented | A terminal command may have arbitrary external side effects; no safe automatic undo is claimed |
 | Android user experience | Remote-only flow implemented | APK is ARM64 debug-signed, not Play Store/release signed |
 
@@ -40,7 +40,7 @@ No embedded VS Code or OpenHands source tree is present in this checkout. The ap
 
 ### P0 — Agent action confirmation needs real runtime proof
 
-The source originally sent `NeverConfirm`. New conversations use `AlwaysConfirm`; reused conversations call the Agent Server confirmation-policy endpoint, poll pending ActionEvents and present tool/action details with explicit approve/reject controls. A dev-app E2E test against OpenHands 1.26.0 and Kilo Free verified both outcomes in a disposable workspace: the file did not exist before either decision; rejection left it absent and reported that execution stopped; approval created only the proposed file with the requested bytes. The conversation also resumed after the Agent Server process was restarted and returned `CONVERSATION_CONTINUED_OK`, exercising the camelCase continuation and confirmation command arguments. Server startup logs a non-fatal browser-tool preload error (`AttributeError: 'Server' object has no attribute 'list_tools'`) and then reports ready. Remaining: prove the runtime cannot escape its workspace, test confirmation across other tool classes, and build diff/undo.
+The source originally sent `NeverConfirm`. New conversations use `AlwaysConfirm`; reused conversations call the Agent Server confirmation-policy endpoint, poll pending ActionEvents and present tool/action details with explicit approve/reject controls. A dev-app E2E test against OpenHands 1.26.0 and Kilo Free verified both outcomes in a disposable workspace: the file did not exist before either decision; rejection left it absent and reported that execution stopped; approval created only the proposed file with the requested bytes. The conversation also resumed after the Agent Server process was restarted and returned `CONVERSATION_CONTINUED_OK`, exercising the camelCase continuation and confirmation command arguments. Server startup logs a non-fatal browser-tool preload error (`AttributeError: 'Server' object has no attribute 'list_tools'`) and then reports ready. Remaining: prove the runtime cannot escape its workspace, test confirmation across other tool classes, and run file-editor rollback against a live Tauri/OpenHands task.
 
 ### P0 — Workspace boundary only covers Flux Hands file commands
 
@@ -56,11 +56,11 @@ The UI sent camelCase `modelPath` and `gpuLayers` to `start_local_model`; Rust e
 
 ### P1 — UI state persistence needs runtime validation
 
-The UI now stores project lists and per-project chat transcripts plus OpenHands conversation IDs in `localStorage`, and migrates the previous single conversation ID. Reload restoration, large transcripts, browser storage failure and independent continuation per chat have not yet been exercised in the desktop UI. Pending approvals and a durable task/event journal are still missing.
+The UI now stores project lists and per-project chat transcripts plus OpenHands conversation IDs in `localStorage`, and migrates the previous single conversation ID. Reload restoration, large transcripts, browser storage failure and independent continuation per chat have not yet been exercised in the desktop UI. Pending approvals and a durable task/event journal are still missing; successful file-editor before/after records are now saved inside each chat transcript, but this persistence has only build-level verification so far.
 
 ### P1 — Editor is intentionally minimal
 
-Monaco is present with a Save button, Ctrl+S and visible dirty indicators. There is no tab/session restore, save conflict detection for external edits, navigation/search integration in the editor, diff view, or undo at agent-action level. Native edit/save flow has not yet been exercised in a desktop window.
+Monaco is present with a Save button, Ctrl+S and visible dirty indicators. There is no tab/session restore, save conflict detection for external edits, or navigation/search integration in the editor. Git diff is available in the Git panel; guarded file-editor rollback is available for local agent actions. Native edit/save flow has not yet been exercised in a desktop window.
 
 ### P1 — Task lifecycle and cancellation remain incomplete
 
@@ -68,7 +68,7 @@ The current working tree adds a stop button and calls OpenHands 1.26.0 `POST /ap
 
 ### P1 — Release maturity differs by platform
 
-The GitHub workflow creates signed Windows updater assets and an ARM64 debug APK. Public stable v1.0.8 currently reports six release assets; the public page does not expose their names in this audit. Candidate v1.0.14-beta.2 (workflow 38220704939) still reports In progress and no workflow artifacts in the public Actions page; stable v1.0.8 remains the newest listed release. The candidate does not contain later source commits or the current uncommitted changes. Its Android job runs after the Windows release job. The previous Android job failed during SDK setup. Local Windows NSIS/MSI builds and APK are unsigned/debug-signed respectively; neither has been installed and smoke-tested on a clean Windows PC or Android device.
+The GitHub workflow creates signed Windows updater assets and an ARM64 debug APK. Public stable v1.0.8 currently reports six release assets; the public page does not expose their names in this audit. Candidate v1.0.14-beta.2 (workflow 38220704939) still reports In progress and no workflow artifacts in the public Actions page; stable v1.0.8 remains the newest listed release. The candidate does not contain later source commits including `bfafbac`, `90eaadd`, or `f0fb1ad`. Its Android job runs after the Windows release job. The previous Android job failed during SDK setup. Local Windows NSIS/MSI builds and APK are unsigned/debug-signed respectively; neither has been installed and smoke-tested on a clean Windows PC or Android device.
 
 ### P1 — Product says “no account/no limits” only within provider constraints
 
@@ -84,7 +84,7 @@ Local inference needs hardware/runtime; Kilo's anonymous free tier has upstream 
 - Android ARM64 debug APK built locally at `src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk` (SHA256 `E2AC4B5C84AA7023C801B8235D1D7D46E1B480A289361137653AF9C9265E2A9B`); apksigner v2 verification and package/version metadata passed. No Android device/emulator was attached.
 - llama.cpp CPU b11429 archive SHA-256 matched upstream GitHub attestation; temporary Llama 3.2 1B Q4_K_M model SHA-256 matched Hugging Face metadata. Dev app returned `FLUX_TAURI_OK` through its native local-model flow.
 - Nemotron-Cascade-8B-Q6_K was rejected before spawn: about 5.0 GB RAM free vs. about 8.3 GB required.
-- Local Agent Server E2E: app launched pinned OpenHands 1.26.0 against a disposable workspace, Kilo Free returned `FLUX_OPENHANDS_OK`, events carried the conversation ID and terminal status, and `stop_agent_server` completed. The original workspace configuration was restored after the test.
+- Local Agent Server E2E: app launched pinned OpenHands 1.26.0 against a disposable workspace, Kilo Free returned `FLUX_OPENHANDS_OK`, events carried the conversation ID and terminal status, and `stop_agent_server` completed. This predates the interrupt UI; live interrupt remains unverified. The original workspace configuration was restored after the test.
 - Kilo Auto Free probe: a direct pinned OpenHands 1.26.0 server in a disposable workspace accepted `openai/kilo-auto/free`, returned `KILO_AUTO_PROBE_OK`, wrote `execution_status=finished` to its event store, and was stopped with the listening port closed. This validates the model ID/gateway path, not the full Tauri UI send flow.
 - Process-tree regression: a Windows test launched a wrapper and child process, ran `terminate_process_tree`, verified the child PID exited, and passed; the production Agent Server path uses this helper.
 - New project/chat UI was checked in a local browser preview; Tauri native folder dialogs and desktop persistence remain unverified.
