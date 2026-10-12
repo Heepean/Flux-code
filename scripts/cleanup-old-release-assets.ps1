@@ -16,7 +16,7 @@ $headers = @{
 $base = "https://api.github.com/repos/$repository"
 $latest = Invoke-RestMethod -Method Get -Uri "$base/releases/latest" -Headers $headers
 $releases = Invoke-RestMethod -Method Get -Uri "$base/releases?per_page=100" -Headers $headers
-$staleReleases = @($releases | Where-Object { $_.id -ne $latest.id })
+$staleReleases = @($releases | Where-Object { -not $_.prerelease -and $_.id -ne $latest.id })
 $removed = 0
 
 foreach ($release in $staleReleases) {
@@ -31,4 +31,4 @@ foreach ($release in $staleReleases) {
     }
 }
 
-Write-Host "Kept latest release $($latest.tag_name); removed $removed older installer/updater assets."
+Write-Host "Kept latest stable release $($latest.tag_name) and all prereleases; removed $removed installer/updater assets from older stable releases."
