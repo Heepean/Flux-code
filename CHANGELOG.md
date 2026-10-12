@@ -1,3 +1,15 @@
+## v1.0.13-beta.1
+
+- Обновлены OpenHands-подтверждения: отказ явно останавливает текущий запуск и показывается в статусе.
+- Доступ desktop-команд для файлов, поиска, Git, загрузки моделей и Agent Server ограничен выбранным проектом.
+- Папка проекта сохраняется в нативной конфигурации и переносится из настроек прежних версий.
+- Beta-кандидат; см. реальные ограничения проверки ниже в release notes.
+
+## v1.0.13
+
+- OpenHands asks before running tool actions; Flux Hands shows the proposed tool action and supports approval or rejection.
+- Workspace file, search, Git, model-download and local Agent Server commands are bound to the natively selected project folder.
+- Project selection persists in native configuration and migrates the workspace choice from earlier versions.
 # История изменений
 
 ## v1.0.12

@@ -6,6 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::WorkspaceState;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -51,6 +52,17 @@ struct AgentEvent {
     done: bool,
     conversation_id: Option<String>,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_approvals: Option<Vec<PendingApproval>>,
+}
+
+#[derive(Serialize, Clone)]
+struct PendingApproval {
+    tool_name: String,
+    security_risk: String,
+    action: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -419,6 +431,7 @@ pub fn get_agent_server_status(state: State<'_, AgentServerState>) -> AgentServe
 pub async fn start_agent_server(
     app: AppHandle,
     state: State<'_, AgentServerState>,
+    workspace_state: State<'_, WorkspaceState>,
     workspace: String,
     provider: String,
     model: String,
@@ -427,6 +440,9 @@ pub async fn start_agent_server(
     let workspace = Path::new(&workspace)
         .canonicalize()
         .map_err(|error| format!("Не удалось открыть проект: {error}"))?;
+    if workspace != workspace_state.active_root()? {
+        return Err("Путь Agent Server не совпадает с открытым проектом Flux Hands".into());
+    }
     if !workspace.is_dir() {
         return Err("Путь проекта не является папкой".into());
     }
@@ -806,6 +822,14 @@ pub async fn send_agent_message(
             let details = conversation.text().await.unwrap_or_default();
             return Err(format!("OpenHands не открыл разговор: {details}"));
         } else {
+            let policy = client
+                .post(format!("{base}/{id}/confirmation_policy"))
+                .header(headers[0].0, &headers[0].1)
+                .json(&serde_json::json!({"policy":{"kind":"AlwaysConfirm"}}))
+                .send()
+                .await
+                .map_err(|error| format!("Не удалось включить подтверждения OpenHands: {error}"))?;
+            ensure_success(policy, "OpenHands не включил подтверждения действий").await?;
             let switched = client
                 .post(format!("{base}/{id}/switch_llm"))
                 .header(headers[0].0, &headers[0].1)
@@ -869,7 +893,7 @@ pub async fn send_agent_message(
                         {"name":"task_tool_set","params":{}}
                     ]
                 },
-                "confirmation_policy": {"kind":"NeverConfirm"},
+                "confirmation_policy": {"kind":"AlwaysConfirm"},
                 "initial_message": {"role":"user", "content":[{"type":"text","text":message}], "run":true},
                 "autotitle": false
             }))
@@ -900,11 +924,16 @@ pub async fn send_agent_message(
             done: false,
             conversation_id: Some(id.clone()),
             error: None,
+            status: None,
+            pending_approvals: None,
         },
     );
     let mut answer = String::new();
     let mut final_status = String::new();
+    let mut action_rejected = false;
     let mut assistant_messages = std::collections::HashSet::new();
+    let mut pending_actions = std::collections::BTreeMap::<String, PendingApproval>::new();
+    let mut approval_prompt_emitted = false;
     for _ in 0..600 {
         let mut new_events = Vec::new();
         let mut page_id = None;
@@ -1000,6 +1029,8 @@ pub async fn send_agent_message(
                             done: false,
                             conversation_id: Some(id.clone()),
                             error: None,
+                            status: None,
+                            pending_approvals: None,
                         },
                     );
                 }
@@ -1009,6 +1040,23 @@ pub async fn send_agent_message(
                     .get("tool_name")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("tool");
+                if let (Some(action_id), Some(action)) = (
+                    event.get("id").and_then(serde_json::Value::as_str),
+                    event.get("action").filter(|action| !action.is_null()),
+                ) {
+                    pending_actions.insert(
+                        action_id.to_owned(),
+                        PendingApproval {
+                            tool_name: name.to_owned(),
+                            security_risk: event
+                                .get("security_risk")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("UNKNOWN")
+                                .to_owned(),
+                            action: action.clone(),
+                        },
+                    );
+                }
                 let activity = format!("\n\n[OpenHands] Запускает инструмент: {name}\n");
                 answer.push_str(&activity);
                 let _ = app.emit(
@@ -1018,10 +1066,16 @@ pub async fn send_agent_message(
                         done: false,
                         conversation_id: Some(id.clone()),
                         error: None,
+                        status: None,
+                        pending_approvals: None,
                     },
                 );
             }
             if kind == "ObservationEvent" {
+                if let Some(action_id) = event.get("action_id").and_then(serde_json::Value::as_str)
+                {
+                    pending_actions.remove(action_id);
+                }
                 let output = event
                     .pointer("/observation/content")
                     .and_then(serde_json::Value::as_array)
@@ -1043,8 +1097,17 @@ pub async fn send_agent_message(
                             done: false,
                             conversation_id: Some(id.clone()),
                             error: None,
+                            status: None,
+                            pending_approvals: None,
                         },
                     );
+                }
+            }
+            if kind == "UserRejectObservation" {
+                action_rejected = true;
+                if let Some(action_id) = event.get("action_id").and_then(serde_json::Value::as_str)
+                {
+                    pending_actions.remove(action_id);
                 }
             }
             if kind == "ConversationStateUpdateEvent" {
@@ -1076,7 +1139,29 @@ pub async fn send_agent_message(
                 return Err(details.to_owned());
             }
         }
-        if ["idle", "finished", "paused", "error"].contains(&final_status.as_str()) {
+        if final_status == "waiting_for_confirmation" && !approval_prompt_emitted {
+            let approvals = pending_actions.values().cloned().collect::<Vec<_>>();
+            if approvals.is_empty() {
+                return Err(
+                    "OpenHands ожидает подтверждение, но не передал действие для проверки".into(),
+                );
+            }
+            let _ = app.emit(
+                "openhands-agent-event",
+                AgentEvent {
+                    delta: String::new(),
+                    done: false,
+                    conversation_id: Some(id.clone()),
+                    error: None,
+                    status: None,
+                    pending_approvals: Some(approvals),
+                },
+            );
+            approval_prompt_emitted = true;
+        } else if final_status != "waiting_for_confirmation" {
+            approval_prompt_emitted = false;
+        }
+        if ["idle", "finished", "paused", "error", "stuck"].contains(&final_status.as_str()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1084,13 +1169,26 @@ pub async fn send_agent_message(
     if final_status.is_empty() || final_status == "running" {
         return Err("Превышено время ожидания выполнения задачи OpenHands".into());
     }
+    let completion_status = if action_rejected {
+        "Действие отклонено · выполнение остановлено"
+    } else {
+        "Готово"
+    };
+    let completion_message = if action_rejected {
+        "\n\nДействие отклонено. Агент остановлен; отправьте новое сообщение, чтобы продолжить задачу."
+    } else {
+        ""
+    };
+    answer.push_str(completion_message);
     let _ = app.emit(
         "openhands-agent-event",
         AgentEvent {
-            delta: String::new(),
+            delta: completion_message.to_owned(),
             done: true,
             conversation_id: Some(id),
             error: None,
+            status: Some(completion_status.to_owned()),
+            pending_approvals: None,
         },
     );
     if answer.trim().is_empty() {
@@ -1099,6 +1197,54 @@ pub async fn send_agent_message(
         ));
     }
     Ok(answer)
+}
+
+#[tauri::command]
+pub async fn respond_to_agent_confirmation(
+    state: State<'_, AgentServerState>,
+    conversation_id: String,
+    accept: bool,
+) -> Result<(), String> {
+    let conversation_id = Uuid::parse_str(&conversation_id)
+        .map_err(|_| "ID разговора OpenHands имеет неверный формат".to_owned())?;
+    let (base, key) = {
+        let port = state.port.lock().map_err(|error| error.to_string())?;
+        let remote_base = state
+            .remote_base
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
+        let key = state
+            .session_key
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone()
+            .ok_or("OpenHands session key is missing")?;
+        let base = match remote_base {
+            Some(base) => base,
+            None => format!(
+                "http://127.0.0.1:{}",
+                port.ok_or("OpenHands Agent Server is not running")?
+            ),
+        };
+        (base, key)
+    };
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!(
+            "{base}/api/conversations/{conversation_id}/events/respond_to_confirmation"
+        ))
+        .header("X-Session-API-Key", key)
+        .json(&serde_json::json!({
+            "accept": accept,
+            "reason": if accept { "Approved in Flux Hands." } else { "Rejected in Flux Hands." }
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Не удалось отправить решение OpenHands: {error}"))?;
+    ensure_success(response, "OpenHands не принял решение по действию").await
 }
 
 async fn ensure_success(response: reqwest::Response, context: &str) -> Result<(), String> {

@@ -18,6 +18,26 @@ struct Runtime {
     llama_install_lock: tokio::sync::Mutex<()>,
 }
 
+#[derive(Default)]
+pub struct WorkspaceState {
+    root: Mutex<Option<PathBuf>>,
+}
+
+impl WorkspaceState {
+    pub(crate) fn active_root(&self) -> Result<PathBuf, String> {
+        self.root
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone()
+            .ok_or_else(|| "Сначала откройте папку проекта".into())
+    }
+
+    fn set_root(&self, root: PathBuf) -> Result<(), String> {
+        *self.root.lock().map_err(|error| error.to_string())? = Some(root);
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 struct LlamaRelease {
     tag_name: String,
@@ -122,16 +142,26 @@ fn available_physical_memory() -> Result<u64, String> {
 }
 
 #[tauri::command]
-fn browse_directory() -> Result<Option<String>, String> {
+fn browse_directory(
+    app: AppHandle,
+    workspace: State<'_, WorkspaceState>,
+) -> Result<Option<String>, String> {
     #[cfg(target_os = "android")]
-    return Err(
-        "Выбор папки доступен на desktop; на Android укажите workspace на удалённом Agent Server"
-            .into(),
-    );
+    {
+        let _ = (app, workspace);
+        return Err(
+            "Выбор папки доступен на desktop; на Android укажите workspace на удалённом Agent Server"
+                .into(),
+        );
+    }
     #[cfg(not(target_os = "android"))]
-    Ok(rfd::FileDialog::new()
-        .pick_folder()
-        .map(|p| p.to_string_lossy().into_owned()))
+    {
+        let selected = rfd::FileDialog::new()
+            .pick_folder()
+            .map(|path| activate_workspace(&app, &workspace, path))
+            .transpose()?;
+        Ok(selected.map(|path| path.to_string_lossy().into_owned()))
+    }
 }
 
 #[tauri::command]
@@ -157,14 +187,110 @@ fn browse_executable() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn default_workspace(app: AppHandle) -> Result<String, String> {
+fn get_workspace_root(
+    app: AppHandle,
+    workspace: State<'_, WorkspaceState>,
+    legacy_path: Option<String>,
+) -> Result<Option<String>, String> {
+    if let Ok(root) = workspace.active_root() {
+        return Ok(Some(root.to_string_lossy().into_owned()));
+    }
+    let config = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| error.to_string())?
+        .join("active-workspace.txt");
+    let saved = match fs::read_to_string(&config) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(legacy_path) = legacy_path else {
+                return Ok(None);
+            };
+            // One-time migration from the workspace path that earlier Flux Hands
+            // versions stored in localStorage. Once migrated, native state owns it.
+            let root = match fs::canonicalize(legacy_path.trim()) {
+                Ok(root) if root.is_dir() => root,
+                _ => return Ok(None),
+            };
+            workspace.set_root(root.clone())?;
+            if let Some(directory) = config.parent() {
+                fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            }
+            fs::write(config, root.to_string_lossy().as_bytes())
+                .map_err(|error| format!("Не удалось перенести папку проекта: {error}"))?;
+            return Ok(Some(root.to_string_lossy().into_owned()));
+        }
+        Err(error) => return Err(format!("Не удалось прочитать настройки проекта: {error}")),
+    };
+    let root = match fs::canonicalize(saved.trim()) {
+        Ok(root) if root.is_dir() => root,
+        _ => return Ok(None),
+    };
+    workspace.set_root(root.clone())?;
+    Ok(Some(root.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn default_workspace(
+    app: AppHandle,
+    workspace: State<'_, WorkspaceState>,
+) -> Result<String, String> {
+    if let Ok(root) = workspace.active_root() {
+        return Ok(root.to_string_lossy().into_owned());
+    }
     let path = app
         .path()
         .document_dir()
         .map_err(|error| error.to_string())?
         .join("Flux Hands Workspace");
     fs::create_dir_all(&path).map_err(|error| error.to_string())?;
-    Ok(path.to_string_lossy().into_owned())
+    let root = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    workspace.set_root(root.clone())?;
+    persist_workspace(&app, &root)?;
+    Ok(root.to_string_lossy().into_owned())
+}
+
+fn activate_workspace(
+    app: &AppHandle,
+    workspace: &WorkspaceState,
+    path: PathBuf,
+) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(path)
+        .map_err(|error| format!("Не удалось открыть папку проекта: {error}"))?;
+    if !root.is_dir() {
+        return Err("Выбранный путь не является папкой".into());
+    }
+    workspace.set_root(root.clone())?;
+    persist_workspace(app, &root)?;
+    Ok(root)
+}
+
+fn persist_workspace(app: &AppHandle, root: &Path) -> Result<(), String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    fs::write(
+        directory.join("active-workspace.txt"),
+        root.to_string_lossy().as_bytes(),
+    )
+    .map_err(|error| format!("Не удалось сохранить папку проекта: {error}"))
+}
+
+fn checked_workspace_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(path);
+    let candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let canonical_candidate = fs::canonicalize(&candidate)
+        .map_err(|error| format!("Путь проекта недоступен: {error}"))?;
+    if !canonical_candidate.starts_with(root) {
+        return Err("Доступ за пределы открытого проекта запрещён".into());
+    }
+    Ok(canonical_candidate)
 }
 
 #[tauri::command]
@@ -301,7 +427,8 @@ async fn install_llama_runtime(
 }
 
 #[tauri::command]
-fn scan_models(path: String) -> Result<Vec<Entry>, String> {
+fn scan_models(workspace: State<'_, WorkspaceState>) -> Result<Vec<Entry>, String> {
+    let path = workspace.active_root()?;
     let mut out = Vec::new();
     for item in std::fs::read_dir(path)
         .map_err(|e| e.to_string())?
@@ -325,8 +452,12 @@ fn scan_models(path: String) -> Result<Vec<Entry>, String> {
     Ok(out)
 }
 #[tauri::command]
-fn list_directory(path: String) -> Result<Vec<Entry>, String> {
-    let path = PathBuf::from(path);
+fn list_directory(
+    workspace: State<'_, WorkspaceState>,
+    path: String,
+) -> Result<Vec<Entry>, String> {
+    let root = workspace.active_root()?;
+    let path = checked_workspace_path(&root, &path)?;
     let entries = std::fs::read_dir(path).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for item in entries.flatten() {
@@ -346,12 +477,20 @@ fn list_directory(path: String) -> Result<Vec<Entry>, String> {
 }
 
 #[tauri::command]
-fn search_workspace(path: String, query: String) -> Result<Vec<SearchResult>, String> {
+fn search_workspace(
+    workspace: State<'_, WorkspaceState>,
+    query: String,
+) -> Result<Vec<SearchResult>, String> {
+    let query = validate_search_query(&query)?;
+    search_workspace_files(&workspace.active_root()?, query)
+}
+
+fn validate_search_query(query: &str) -> Result<&str, String> {
     let query = query.trim();
     if query.is_empty() || query.chars().count() > 256 {
         return Err("Введите поисковый текст длиной до 256 символов".into());
     }
-    search_workspace_files(Path::new(&path), query)
+    Ok(query)
 }
 
 fn search_workspace_files(path: &Path, query: &str) -> Result<Vec<SearchResult>, String> {
@@ -427,7 +566,12 @@ fn git_output(path: &str, args: &[&str]) -> Result<std::process::Output, String>
 }
 
 #[tauri::command]
-fn git_status(path: String) -> Result<GitStatus, String> {
+fn git_status(workspace: State<'_, WorkspaceState>) -> Result<GitStatus, String> {
+    git_status_for(&workspace.active_root()?)
+}
+
+fn git_status_for(path: &Path) -> Result<GitStatus, String> {
+    let path = path.to_string_lossy().into_owned();
     if !Path::new(&path).is_dir() {
         return Err("Папка проекта недоступна".into());
     }
@@ -487,15 +631,25 @@ fn git_status(path: String) -> Result<GitStatus, String> {
 }
 
 #[tauri::command]
-fn read_text_file(path: String) -> Result<String, String> {
+fn read_text_file(workspace: State<'_, WorkspaceState>, path: String) -> Result<String, String> {
+    let root = workspace.active_root()?;
+    let path = checked_workspace_path(&root, &path)?;
+    if !path.is_file() {
+        return Err("Путь не указывает на файл проекта".into());
+    }
     std::fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn write_text_file(path: String, content: String) -> Result<(), String> {
-    let path = PathBuf::from(path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+fn write_text_file(
+    workspace: State<'_, WorkspaceState>,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    let root = workspace.active_root()?;
+    let path = checked_workspace_path(&root, &path)?;
+    if !path.is_file() {
+        return Err("Можно сохранять только существующие файлы проекта".into());
     }
     std::fs::write(path, content).map_err(|e| e.to_string())
 }
@@ -679,9 +833,9 @@ fn valid_hf_repo(repo: &str) -> bool {
 
 #[tauri::command]
 async fn download_model(
+    workspace: State<'_, WorkspaceState>,
     repo: String,
     file: String,
-    destination: String,
     token: Option<String>,
 ) -> Result<String, String> {
     if !valid_hf_repo(&repo) {
@@ -696,7 +850,7 @@ async fn download_model(
     {
         return Err("Путь GGUF внутри Hugging Face repository недопустим".into());
     }
-    let destination = PathBuf::from(destination);
+    let destination = workspace.active_root()?;
     tokio::fs::create_dir_all(&destination)
         .await
         .map_err(|e| format!("Не удалось подготовить папку моделей: {e}"))?;
@@ -832,12 +986,14 @@ pub fn run() {
             log: Arc::new(Mutex::new(String::new())),
             llama_install_lock: tokio::sync::Mutex::new(()),
         })
+        .manage(WorkspaceState::default())
         .manage(openhands::AgentServerState::default())
         .invoke_handler(tauri::generate_handler![
             list_directory,
             browse_directory,
             browse_gguf,
             browse_executable,
+            get_workspace_root,
             default_workspace,
             path_is_file,
             install_llama_runtime,
@@ -857,6 +1013,7 @@ pub fn run() {
             openhands::stop_agent_server,
             openhands::get_agent_server_status,
             openhands::send_agent_message,
+            openhands::respond_to_agent_confirmation,
             openhands::save_model_provider_key,
             openhands::remove_model_provider_key,
             openhands::model_provider_key_configured,
@@ -888,8 +1045,8 @@ pub fn run() {
 #[cfg(test)]
 mod workspace_search_tests {
     use super::{
-        git_status, ignored_search_directory, matching_lines, search_workspace,
-        search_workspace_files,
+        checked_workspace_path, git_status_for, ignored_search_directory, matching_lines,
+        search_workspace_files, validate_search_query,
     };
     use std::fs;
     use std::process::Command;
@@ -939,8 +1096,56 @@ mod workspace_search_tests {
 
     #[test]
     fn workspace_search_rejects_empty_and_excessive_queries() {
-        assert!(search_workspace("missing-project".into(), "  ".into()).is_err());
-        assert!(search_workspace("missing-project".into(), "x".repeat(257)).is_err());
+        assert!(validate_search_query("  ").is_err());
+        assert!(validate_search_query(&"x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn file_commands_are_bound_to_the_canonical_workspace_root() {
+        let parent =
+            std::env::temp_dir().join(format!("flux-hands-boundary-{}", uuid::Uuid::new_v4()));
+        let root = parent.join("project");
+        let outside = parent.join("project-sibling");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let project_file = root.join("source.txt");
+        let outside_file = outside.join("secret.txt");
+        fs::write(&project_file, "before").unwrap();
+        fs::write(&outside_file, "secret").unwrap();
+
+        let root = fs::canonicalize(root).unwrap();
+        let project_path = project_file.to_string_lossy().into_owned();
+        let outside_path = outside_file.to_string_lossy().into_owned();
+        assert_eq!(
+            checked_workspace_path(&root, &project_path).unwrap(),
+            root.join("source.txt")
+        );
+        assert!(checked_workspace_path(&root, &outside_path).is_err());
+        assert_eq!(fs::read_to_string(&project_file).unwrap(), "before");
+        assert_eq!(fs::read_to_string(&outside_file).unwrap(), "secret");
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_commands_reject_symlinks_that_escape_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let parent =
+            std::env::temp_dir().join(format!("flux-hands-symlink-{}", uuid::Uuid::new_v4()));
+        let root = parent.join("project");
+        let outside = parent.join("outside.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "secret").unwrap();
+        let link = root.join("linked.txt");
+        symlink(&outside, &link).unwrap();
+
+        let root = fs::canonicalize(root).unwrap();
+        assert!(checked_workspace_path(&root, &link.to_string_lossy()).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
+
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
@@ -970,7 +1175,7 @@ mod workspace_search_tests {
         fs::write(root.join("tracked.txt"), "after").unwrap();
         fs::write(root.join("new file.txt"), "new").unwrap();
 
-        let status = git_status(root.to_string_lossy().into_owned()).unwrap();
+        let status = git_status_for(&root).unwrap();
         assert_eq!(status.branch, "test-branch");
         assert_eq!(status.changes.len(), 2);
         assert!(status
