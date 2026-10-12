@@ -127,7 +127,7 @@ jobs:
           $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
           $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           $version = [string]$config.version
-          $expected = @("Flux.Hands_${version}_x64-setup.exe", "Flux.Hands_${version}_x64-setup.exe.sig", 'latest.json', "Flux Hands_${version}_x64_en-US.msi")
+          $expected = @("Flux.Hands_${version}_x64-setup.exe", "Flux.Hands_${version}_x64-setup.exe.sig", 'latest.json', "Flux.Hands_${version}_x64_en-US.msi")
           $release = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$env:RELEASE_TAG" -Headers $headers
           $assets = Invoke-RestMethod -Method Get -Uri $release.assets_url -Headers $headers
           $names = $assets | ForEach-Object { $_.name }
@@ -228,7 +228,7 @@ jobs:
             "Flux.Hands_${version}_x64-setup.exe",
             "Flux.Hands_${version}_x64-setup.exe.sig",
             'latest.json',
-            "Flux Hands_${version}_x64_en-US.msi",
+            "Flux.Hands_${version}_x64_en-US.msi",
             "Flux.Hands_$($env:RELEASE_TAG)_android-arm64-debug.apk"
           )
           $release = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$env:RELEASE_TAG" -Headers $headers
