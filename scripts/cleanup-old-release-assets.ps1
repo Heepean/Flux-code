@@ -16,8 +16,9 @@ $headers = @{
 $base = "https://api.github.com/repos/$repository"
 $latest = Invoke-RestMethod -Method Get -Uri "$base/releases/latest" -Headers $headers
 $currentTag = $env:GITHUB_REF_NAME
-if (-not $currentTag) {
-    throw 'GITHUB_REF_NAME is required to preserve the release being published.'
+if ($currentTag -notmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
+    Write-Host "Skipping release-asset cleanup for non-release ref '$currentTag'. Cleanup runs only after a versioned release is created."
+    exit 0
 }
 $current = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$currentTag" -Headers $headers
 $releases = @()
