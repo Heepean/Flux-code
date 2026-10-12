@@ -7,16 +7,17 @@ This file tracks the path to a dependable daily-use release. “Implemented” d
 | Requirement | Status | Evidence / next check |
 | --- | --- | --- |
 | Reproducible frontend build | Verified in current audit | `npm run build` passed 2026-10-12 |
-| Windows installers | Built locally, not install-tested | v1.0.13 NSIS/MSI built; no local updater signature or Authenticode signature; use CI artifacts for official release |
+| Windows installers | Official beta.3 installers published; install test pending | Signed updater NSIS/MSI assets exist; install and smoke test on clean Windows |
 | Android APK | Built and package metadata/signature checked; runtime unverified | v1.0.13 ARM64 debug APK; install and smoke test on Android 15+ device |
 | Open project and edit/save files | Implemented; runtime verification pending | Run scenario on clean supported Windows; test read-only, large, external-change and failed-save cases |
+| Local GGUF model flow | Partially verified through dev app | Tauri native command loaded temporary 1B GGUF, health/chat passed, stop killed server; user 8B model refused due RAM. Verify selected full-size model on suitable hardware |
 | OpenHands model/task flow | Implemented; end-to-end verification pending | Test local runtime and remote server with tool-capable model |
 | Agent action approval | Implemented in code; runtime proof pending | `AlwaysConfirm`, pending-action display and approve/reject endpoint; test against OpenHands 1.26 and verify fail-closed behavior |
 | Workspace access boundary | Implemented for native commands; incomplete for runtime | Native selected root, rootless IPC for file/search/Git/model download, canonical target checks; cover Windows junction/race cases and OpenHands tool sandbox separately |
 | Change diff and real undo | Missing | Implement captured before-state/diff and rollback |
 | Error diagnostics and process cleanup | Partial | Some errors shown and child processes stopped on exit; test crashes, startup timeout, cancellation and repeated launch |
 | Data/history persistence | Partial | Preferences and conversation ID persist; transcript/activity not restored in UI |
-| Public release | Pending candidate publication | GitHub stable latest is v1.0.8 and has no APK; CI release workflow requires signing secrets, candidate changes are not yet pushed |
+| Public release | Beta candidate active; Android asset pending | Beta.3 signed Windows assets published; Android job failed at SDK setup. Separate license/package workflow steps are staged for next candidate |
 
 ## P1 — usability and reliability
 

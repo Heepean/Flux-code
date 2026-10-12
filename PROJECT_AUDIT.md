@@ -1,6 +1,6 @@
 # Flux Code / Flux Hands project audit
 
-Audit snapshot: 2026-10-12, local checkout `D:\Flux code\repo-check`, changes prepared for `v1.0.13-beta.1` based on `e73a795` (`v1.0.12`). Flux Code and Flux Hands refer to this one project. This is a source/build audit, not a claim that every workflow was exercised on a clean user machine.
+Audit snapshot: 2026-10-12, local checkout `D:\Flux code\repo-check`, preparing `v1.0.14-beta.1` after `v1.0.13-beta.3`. Flux Code and Flux Hands refer to this one project. This is a source/build and focused runtime audit, not a claim that every workflow was exercised on a clean user machine.
 
 ## Architecture observed
 
@@ -21,9 +21,9 @@ No embedded VS Code or OpenHands source tree is present in this checkout. The ap
 | React/Tauri desktop app and Monaco editor | Implemented | `npm run build` passed |
 | Browse project, list/read/write files | Implemented | Source reviewed; no clean Windows runtime scenario run here |
 | Save editor content | Implemented as immediate write on editor change | Source reviewed; no external-change/conflict test; no dirty-state/recovery flow evident |
-| Workspace text search | Implemented in Rust; skips selected directories and large/binary files | Rust unit tests pass (8 total) |
+| Workspace text search | Implemented in Rust; skips selected directories and large/binary files | Rust unit tests pass (9 total) |
 | Git branch/status and changed file opening | Implemented (read-only status) | Rust temp-repository test passes |
-| Local GGUF launch/switch | Implemented with CPU runtime bootstrap, RAM check and one child process | Source reviewed; no real model execution in this audit |
+| Local GGUF launch/switch | Implemented with CPU runtime bootstrap, RAM check and one child process | Real small GGUF loaded through native app commands; health and chat passed, then stop closed the port. Full user models are refused on this machine's available RAM |
 | Hugging Face model search/download | Implemented for desktop | Source reviewed; no network/download scenario run here |
 | OpenHands local/remote task execution | Implemented using API/event polling | Source reviewed; no real Agent Server/provider end-to-end scenario in this audit |
 | Kilo free catalog | Implemented against live Kilo endpoint | Source reviewed; no live-provider task run here |
@@ -42,9 +42,9 @@ The source originally sent `NeverConfirm`. This turn changed new conversations t
 
 Desktop native state records the active root from the OS folder picker and persists it; workspace file/list/search/Git/model-download commands no longer accept a caller-supplied root. Targets are canonicalized and rejected outside that active root, and editor saves only affect existing files. Unit coverage verifies that a sibling path and a symlink escape are rejected where symlinks are supported. Windows junction escape and root-switch races still need coverage. This does not sandbox OpenHands' independent runtime or terminal tool; test and document that boundary separately.
 
-### P0 — GitHub stable release lags current candidate
+### P0 — Local model command mismatch fixed; broad provider verification remains
 
-GitHub `main` is at `e73a795`; latest stable public release is v1.0.8 with Windows assets and no Android APK. Local candidate changes are uncommitted and not published. Publishing v1.0.13-beta.1 requires a Git push and tag-triggered Actions; publication must be confirmed by inspecting the public release assets.
+The UI sent camelCase `modelPath` and `gpuLayers` to `start_local_model`; Rust expected snake_case in the nested struct, so UI-triggered GGUF startup failed before spawning the server. `StartModel` now deserializes camelCase and a regression test covers this. The dev app's native command was re-run successfully with a temporary 1B model. Live OpenHands/provider integration remains unverified.
 
 ### P1 — UI state persistence is incomplete
 
@@ -60,7 +60,7 @@ The UI has one busy flag and streams event text/status, but no task list, pause/
 
 ### P1 — Release maturity differs by platform
 
-The GitHub workflow is designed to create signed Windows updater assets and an ARM64 debug APK. Local Windows NSIS/MSI builds succeeded with updater artifact generation disabled because signing secrets are unavailable; NSIS is not Authenticode-signed. Local APK is debug-signed. Neither artifact has been installed and smoke-tested on a clean Windows PC or Android device in this audit.
+The GitHub workflow creates signed Windows updater assets and an ARM64 debug APK. Public beta.3 has signed Windows assets, but its Android job failed in the combined SDK license/package installation step before APK build. Workflow now separates those operations so the next run can identify the failing command. Local Windows NSIS/MSI builds and APK are unsigned/debug-signed respectively; neither has been installed and smoke-tested on a clean Windows PC or Android device.
 
 ### P1 — Product says “no account/no limits” only within provider constraints
 
@@ -69,23 +69,26 @@ Local inference needs hardware/runtime; Kilo's anonymous free tier has upstream 
 ## Build and repository state
 
 - `npm run build`: passed on 2026-10-12 (TypeScript compile and Vite production build).
-- `cargo test --manifest-path src-tauri/Cargo.toml`: passed 8 tests on 2026-10-12 after workspace-boundary work.
-- After the confirmation flow change: `cargo test --manifest-path src-tauri/Cargo.toml` passed (8 tests) and `npm run build` passed on 2026-10-12.
+- `cargo test --manifest-path src-tauri/Cargo.toml`: passed 9 tests after adding the `StartModel` camelCase regression test.
+- `npm run build`: passed after the local model command fix.
 - Windows NSIS (3,815,192 bytes) and MSI (5,677,056 bytes) v1.0.13 installers built locally. Tauri updater signing failed because the private signing key is only available in GitHub Actions; no local Authenticode signature was established.
 - Android ARM64 debug APK built locally at `src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk` (SHA256 `E2AC4B5C84AA7023C801B8235D1D7D46E1B480A289361137653AF9C9265E2A9B`); apksigner v2 verification and package/version metadata passed. No Android device/emulator was attached.
-- GitHub latest stable release verified through public API: v1.0.8, Windows NSIS/MSI and updater assets present, Android APK absent. Candidate publication is pending.
+- llama.cpp CPU b11429 archive SHA-256 matched upstream GitHub attestation; temporary Llama 3.2 1B Q4_K_M model SHA-256 matched Hugging Face metadata. Dev app returned `FLUX_TAURI_OK` through its native local-model flow.
+- Nemotron-Cascade-8B-Q6_K was rejected before spawn: about 5.0 GB RAM free vs. about 8.3 GB required.
+- GitHub beta.3 has signed Windows assets. Its Android job failed at SDK setup; the separated license/package steps have not yet run in CI.
 - Clean-machine installed-app smoke test: not performed.
 
 ## Immediate implementation order
 
 1. Exercise approval and rejection with a live OpenHands 1.26 test server; verify that no action runs before approval and rejected runs visibly stop.
-2. Add Windows junction/root-switch race coverage to the selected-workspace boundary; establish and test the OpenHands runtime's actual containment.
-3. Add task stop/cancel behavior and durable event/transcript state; test process cleanup on app exit and failure.
-4. Implement agent change preview (diff) and rollback based on recorded file state.
-5. Run repeatable integration scenarios for llama.cpp, local/remote OpenHands, provider switching, and Android remote connection.
-6. Complete editor/session persistence and external file change handling.
-7. Publish a beta candidate through CI, inspect all assets, and install-test on Windows and Android before any stable readiness claim.
+2. Publish a CI run with separated Android license and SDK installation steps; finish APK build and verify release assets.
+3. Add Windows junction/root-switch race coverage to the selected-workspace boundary; establish and test the OpenHands runtime's actual containment.
+4. Add task stop/cancel behavior and durable event/transcript state; test process cleanup on app exit and failure.
+5. Implement agent change preview (diff) and rollback based on recorded file state.
+6. Run repeatable integration scenarios for local/remote OpenHands, provider switching, and Android remote connection.
+7. Complete editor/session persistence and external file change handling.
+8. Install-test official installers on clean Windows and Android targets before any stable readiness claim.
 
 ## Scope limits
 
-This audit reviewed the available source, repository metadata, release workflow, and local build artifacts. It did not run an OpenHands server with a real model, install the desktop application on a clean machine, connect an Android device, conduct a security penetration test, or publish to GitHub. Statuses must be updated when those checks are actually carried out.
+This audit reviewed source, CI/release status and artifacts, and ran a real small-GGUF inference request through the Tauri dev app's native local-model commands. It did not run an OpenHands server, install the official desktop release on a clean machine, connect an Android device, or conduct a security penetration test. Statuses must be updated when those checks are carried out.

@@ -73,13 +73,14 @@ jobs:
           "installer=$installer" >> $env:GITHUB_OUTPUT
           "signature=$signature" >> $env:GITHUB_OUTPUT
           "manifest=$manifestPath" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: Flux Hands ${{ github.ref_name }}
           generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-beta.') }}
-          body_path: .github/release-notes/v1.0.13.md
+          body_path: .github/release-notes/v${{ steps.assets.outputs.version }}.md
           files: |
             ${{ steps.assets.outputs.installer }}
             ${{ steps.assets.outputs.signature }}
@@ -111,9 +112,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set +o pipefail
+          yes | sdkmanager --licenses
       - name: Install Android SDK packages
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
           sdkmanager 'platform-tools' 'platforms;android-37' 'build-tools;36.0.0' 'ndk;27.2.12479018'
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - name: Install frontend dependencies

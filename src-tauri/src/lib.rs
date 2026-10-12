@@ -119,6 +119,7 @@ fn matching_lines(text: &str, query: &str, path: &str, limit: usize) -> Vec<Sear
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartModel {
     model_path: String,
     executable: String,
@@ -1046,10 +1047,26 @@ pub fn run() {
 mod workspace_search_tests {
     use super::{
         checked_workspace_path, git_status_for, ignored_search_directory, matching_lines,
-        search_workspace_files, validate_search_query,
+        search_workspace_files, validate_search_query, StartModel,
     };
     use std::fs;
     use std::process::Command;
+
+    #[test]
+    fn local_model_config_deserializes_frontend_camel_case_fields() {
+        let config: StartModel = serde_json::from_value(serde_json::json!({
+            "modelPath": "C:/models/test.gguf",
+            "executable": "C:/runtime/llama-server.exe",
+            "context": 1024,
+            "gpuLayers": 0
+        }))
+        .unwrap();
+
+        assert_eq!(config.model_path, "C:/models/test.gguf");
+        assert_eq!(config.executable, "C:/runtime/llama-server.exe");
+        assert_eq!(config.context, Some(1024));
+        assert_eq!(config.gpu_layers, Some(0));
+    }
 
     #[test]
     fn search_matches_case_insensitively_and_keeps_line_numbers() {
