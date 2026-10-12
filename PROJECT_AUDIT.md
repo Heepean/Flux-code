@@ -153,3 +153,10 @@ This audit reviewed source, CI/release status and artifacts, ran a real small-GG
 - Queried the installed Android SDK Manager package catalog: there is no `platforms;android-37` package ID. The available matching platform IDs are `platforms;android-37.0`, `.1`, and `.2`; the project uses compileSdk/targetSdk 37 and this workstation builds against 37.0. Updated the workflow to install `platforms;android-37.0`.
 - Windows job in run `38227227774` completed the signed installer build and asset upload, then failed its own asset-name assertion. The check expected `Flux Hands_1.0.15_x64_en-US.msi`; the public v1.0.8 asset demonstrates the actual `Flux.Hands_1.0.8_x64_en-US.msi` naming convention. Corrected the expected MSI name to `Flux.Hands_...` in both the Windows check and final publish gate.
 - Updated workflow fixes for the SDK package and MSI name are local but not yet pushed, so neither has been validated by another hosted Actions run. The draft remains unpublished pending that run.
+
+## Follow-up verification — release asset gate — 2026-10-12
+
+- Forced the `v1.0.15-beta.1` tag to the corrected SDK/MSI checks and started run `38228369458`. Android installed API 37.0, built the ARM64 APK, verified its signature and uploaded it. Windows built signed installers and uploaded them. The release remained a draft as intended.
+- Both jobs then failed only in their duplicate per-job GitHub asset-list checks; the final publish job was skipped. Public check-run annotations show generic exit code only. The hosted build/upload steps themselves succeeded.
+- Reworked the local workflow to use `softprops/action-gh-release@v3`, explicitly overwrite assets on reruns, remove the two parallel list checks, and perform a single post-build check with retries. The gate requires setup, signature, updater manifest, APK, exactly one version-matching MSI (accepting space or dot product-name separators), and positive asset sizes before publishing.
+- The updated workflow is locally YAML-validated but has not yet run in GitHub Actions. v1.0.15-beta.1 remains an unpublished draft; the public latest release remains v1.0.8.

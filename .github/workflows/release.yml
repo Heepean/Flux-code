@@ -25,7 +25,7 @@ jobs:
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: Flux Hands ${{ github.ref_name }}
@@ -106,38 +106,17 @@ jobs:
           }
           "staging=release-assets" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: Flux Hands ${{ github.ref_name }}
           generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-beta.') }}
           draft: true
+          overwrite_files: true
           body_path: .github/release-notes/v${{ steps.assets.outputs.version }}.md
           files: release-assets/*
           fail_on_unmatched_files: true
-      - name: Verify Windows release assets
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
-          $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
-          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          $version = [string]$config.version
-          $expected = @("Flux.Hands_${version}_x64-setup.exe", "Flux.Hands_${version}_x64-setup.exe.sig", 'latest.json', "Flux.Hands_${version}_x64_en-US.msi")
-          $release = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$env:RELEASE_TAG" -Headers $headers
-          $assets = Invoke-RestMethod -Method Get -Uri $release.assets_url -Headers $headers
-          $names = $assets | ForEach-Object { $_.name }
-          $missing = $expected | Where-Object { $_ -notin $names }
-          if ($missing) { throw "Release is missing assets: $($missing -join ', ')" }
-          foreach ($name in $expected) {
-            $asset = $assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
-            if ($asset.size -le 0) { throw "Release asset is empty: $name" }
-          }
-          Write-Host "Verified $($expected.Count) non-empty Windows installer/updater assets for $env:RELEASE_TAG."
   android:
     needs: prepare_release
     runs-on: ubuntu-24.04
@@ -187,28 +166,13 @@ jobs:
           cp "$apk" "$RUNNER_TEMP/Flux.Hands_${GITHUB_REF_NAME}_android-arm64-debug.apk"
           echo "apk=$RUNNER_TEMP/Flux.Hands_${GITHUB_REF_NAME}_android-arm64-debug.apk" >> "$GITHUB_OUTPUT"
       - name: Upload Android APK to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: ${{ steps.android_asset.outputs.apk }}
           fail_on_unmatched_files: true
           draft: true
-      - name: Verify Android APK release asset
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
-          $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
-          $expected = "Flux.Hands_$($env:RELEASE_TAG)_android-arm64-debug.apk"
-          $release = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$env:RELEASE_TAG" -Headers $headers
-          $assets = Invoke-RestMethod -Method Get -Uri $release.assets_url -Headers $headers
-          $apk = $assets | Where-Object { $_.name -eq $expected } | Select-Object -First 1
-          if (-not $apk -or $apk.size -le 0) { throw "Android APK release asset is missing or empty: $expected" }
-          Write-Host "Verified Android APK $expected ($($apk.size) bytes)."
-
+          overwrite_files: true
   publish_release:
     needs: [release, android]
     runs-on: windows-latest
@@ -228,21 +192,37 @@ jobs:
             "Flux.Hands_${version}_x64-setup.exe",
             "Flux.Hands_${version}_x64-setup.exe.sig",
             'latest.json',
-            "Flux.Hands_${version}_x64_en-US.msi",
             "Flux.Hands_$($env:RELEASE_TAG)_android-arm64-debug.apk"
           )
-          $release = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$env:RELEASE_TAG" -Headers $headers
-          if (-not $release.draft) { throw 'Release was published before all platform assets were verified.' }
-          $assets = Invoke-RestMethod -Method Get -Uri $release.assets_url -Headers $headers
-          $missing = $expected | Where-Object { $_ -notin $assets.name }
-          if ($missing) { throw "Draft release is missing assets: $($missing -join ', ')" }
-          foreach ($name in $expected) {
-            $asset = $assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
-            if ($asset.size -le 0) { throw "Release asset is empty: $name" }
+          $msiPattern = '^Flux[ .]Hands_' + [regex]::Escape($version) + '_x64_en-US\.msi$'
+          $release = $null
+          $assets = @()
+          $missing = @($expected)
+          $msiAssets = @()
+          $lastCheck = 'GitHub has not returned the required assets yet.'
+          for ($attempt = 1; $attempt -le 6; $attempt++) {
+            try {
+              $release = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$env:RELEASE_TAG" -Headers $headers
+              if (-not $release.draft) { throw 'Release was published before all platform assets were verified.' }
+              $assets = @(Invoke-RestMethod -Method Get -Uri $release.assets_url -Headers $headers)
+              $names = @($assets | ForEach-Object { $_.name })
+              $missing = @($expected | Where-Object { $_ -notin $names })
+              $msiAssets = @($assets | Where-Object { $_.name -match $msiPattern })
+              if ($missing.Count -eq 0 -and $msiAssets.Count -eq 1) { break }
+              $lastCheck = "Missing required assets: $($missing -join ', '); matching MSI count: $($msiAssets.Count)."
+            } catch {
+              $lastCheck = $_.Exception.Message
+            }
+            if ($attempt -lt 6) { Start-Sleep -Seconds 5 }
+          }
+          if ($missing.Count -gt 0 -or $msiAssets.Count -ne 1) { throw "Release assets did not pass verification after six checks. $lastCheck" }
+          $verifiedAssets = @($assets | Where-Object { $_.name -in $expected }) + $msiAssets
+          foreach ($asset in $verifiedAssets) {
+            if ($asset.size -le 0) { throw "Release asset is empty: $($asset.name)" }
           }
           $body = @{ draft = $false; prerelease = ($env:RELEASE_TAG -match '-beta\.\d+$') } | ConvertTo-Json
           Invoke-RestMethod -Method Patch -Uri "$base/releases/$($release.id)" -Headers $headers -ContentType 'application/vnd.github+json' -Body $body | Out-Null
-          Write-Host "Published $env:RELEASE_TAG after verifying all $($expected.Count) Windows and Android assets."
+          Write-Host "Published $env:RELEASE_TAG after verifying $($verifiedAssets.Count) Windows and Android assets."
       - name: Remove installers from older releases
         shell: pwsh
         env:
