@@ -7,11 +7,11 @@ This file tracks the path to a dependable daily-use release. “Implemented” d
 | Requirement | Status | Evidence / next check |
 | --- | --- | --- |
 | Reproducible frontend build | Verified in current audit | `npm run build` passed 2026-10-12 |
-| Windows installers | Official beta.3 installers published; install test pending | Signed updater NSIS/MSI assets exist; install and smoke test on clean Windows |
-| Android APK | Built and package metadata/signature checked; runtime unverified | v1.0.13 ARM64 debug APK; install and smoke test on Android 15+ device |
-| Open project and edit/save files | Implemented; runtime verification pending | Run scenario on clean supported Windows; test read-only, large, external-change and failed-save cases |
-| Create/switch projects | Implemented; native path helper covered | Rust test validates child-folder creation and rejects traversal; native folder-picker and Tauri UI flow still need runtime verification |
-| Multiple chats per project | Implemented; runtime verification pending | UI stores independent transcripts and OpenHands IDs by workspace; exercise chat switching, reload restore and continuation in desktop app |
+| Windows installers | Stable v1.0.8 release page reports 6 assets; candidate beta.2 workflow is in progress | Verify exact installer/updater names, signatures and hashes after Actions run 38220704939; install and smoke test on clean Windows |
+| Android APK | No current candidate APK verified | Candidate beta.2 Android job runs after Windows release job; previous Android SDK setup failed. Verify APK signature, package metadata, hash, then install on Android 15+ |
+| Open project and edit/save files | Implemented with explicit Save/Ctrl+S and dirty-tab indicator; build verified | Native desktop save, failed-save recovery, large/read-only files and external-change conflicts still need runtime checks |
+| Create/switch projects | Implemented; Rust helper and browser-preview dialog checked | Rust test validates child-folder creation and rejects traversal; folder picker and project switching in native Tauri UI still need runtime verification |
+| Multiple chats per project | Implemented; creation visible in browser preview | UI stores independent transcripts and OpenHands IDs by workspace; desktop switching, reload restore and continuation remain unverified |
 | Local GGUF model flow | Partially verified through dev app | Tauri native command loaded temporary 1B GGUF, health/chat passed, stop killed server; user 8B model refused due RAM. Verify selected full-size model on suitable hardware |
 | OpenHands model/task flow | Partially verified end to end | Dev app approval/continuation scenarios were previously exercised. Direct OpenHands 1.26.0 probe verified `openai/kilo-auto/free` returned a real answer and persisted `finished`; tool actions and other providers remain in scope |
 | Agent action approval | Verified for file_editor create action | Against OpenHands 1.26.0 + Kilo Free in disposable workspace: action displayed before decision; reject left file absent; approve created exact requested file; continuation after server restart succeeded. Runtime workspace escape and other tool types remain unverified |
@@ -19,7 +19,7 @@ This file tracks the path to a dependable daily-use release. “Implemented” d
 | Change diff and real undo | Missing | Implement captured before-state/diff and rollback |
 | Error diagnostics and process cleanup | Partial | Windows process-tree regression test confirms a wrapper stop kills its descendant; test real app startup failure, cancellation and repeated launch |
 | Data/history persistence | Partial | Project/chat/transcript/conversation IDs now persist in local storage; desktop reload/switch behavior and durable activity/approval journal need runtime verification |
-| Public release | Beta candidate active; Android asset pending | Beta.3 signed Windows assets published; Android job failed at SDK setup. Separate license/package workflow steps are staged for next candidate |
+| Public release | v1.0.14-beta.2 candidate active; next source commit includes editor-save changes | Actions run 38220704939 is in progress for commit 0634555; beta.2 does not include later editor-save commit bfafbac. Do not treat source archives as installers |
 
 ## P1 — usability and reliability
 

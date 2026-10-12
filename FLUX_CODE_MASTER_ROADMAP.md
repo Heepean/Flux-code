@@ -21,9 +21,9 @@ Build a dependable Windows desktop workspace for projects, local GGUF models, re
 - The app started OpenHands Agent Server 1.26.0 in a disposable workspace and completed a Kilo Free text task, including streamed UI events and clean server shutdown. A live `file_editor.create` action was displayed before execution: rejection kept the file absent, approval created the requested file, and the same conversation resumed after server restart.
 - That OpenHands startup logged a non-fatal browser-tool preload error (`Server.list_tools` missing); text tasks worked. A prior live dev-app scenario verified file-editor approval/rejection and conversation continuation; runtime workspace containment remains unverified.
 - A direct pinned OpenHands 1.26.0 request using the app's `openai/kilo-auto/free` model ID returned the expected Kilo response and finished; the full native UI flow still needs a desktop-window smoke test.
-- Project creation and per-project chats/transcripts are implemented and build-tested; native folder dialogs, project switching and chat reload/continuation still need UI runtime verification.
-- Windows installers and Android APK can be built locally, but a clean Windows install and a physical Android 15+ launch have not been verified. The last public beta had Windows assets; its Android workflow failed during SDK setup.
-- Git push authentication is available; publishing v1.0.14-beta.1 remains pending the final commit/tag push and successful signed Windows/APK CI run.
+- Project creation and per-project chats/transcripts are implemented; browser preview showed the open-existing/create-new dialog and new-chat entry. Native folder dialogs, project switching and chat reload/continuation still need UI runtime verification.
+- The editor now has explicit Save/Ctrl+S and dirty indicators; only the production frontend build has been verified for this change. Native editing, failed save and external-change scenarios remain pending.
+- Stable v1.0.8 currently reports six assets on its public release page. Candidate v1.0.14-beta.2 is running Actions workflow 38220704939 for commit 0634555; the current main source has advanced to bfafbac. Its Windows assets and Android APK must be verified after the workflow finishes. Clean Windows installation and physical Android 15+ launch remain unverified.
 
 See [PROJECT_AUDIT.md](PROJECT_AUDIT.md) for evidence and limitations, and [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for release gates.
 
