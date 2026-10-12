@@ -50,11 +50,16 @@ jobs:
           if (-not $source) { throw 'NSIS installer was not generated.' }
           $sourceSig = "$($source.FullName).sig"
           if (-not (Test-Path $sourceSig)) { throw 'Tauri updater signature is missing.' }
+          $msi = Get-ChildItem 'src-tauri/target/release/bundle/msi' -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'MSI installer was not generated.' }
+          $staging = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
           $assetName = "Flux.Hands_${version}_x64-setup.exe"
-          $installer = Join-Path $env:RUNNER_TEMP $assetName
+          $installer = Join-Path $staging $assetName
           $signature = "$installer.sig"
           Copy-Item $source.FullName $installer
           Copy-Item $sourceSig $signature
+          Copy-Item $msi.FullName (Join-Path $staging $msi.Name)
           $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG"
           $manifest = @{
             version = $version
@@ -67,12 +72,14 @@ jobs:
               }
             }
           } | ConvertTo-Json -Depth 6
-          $manifestPath = Join-Path $env:RUNNER_TEMP 'latest.json'
+          $manifestPath = Join-Path $staging 'latest.json'
           [System.IO.File]::WriteAllText($manifestPath, $manifest, [System.Text.UTF8Encoding]::new($false))
-          if (-not (Test-Path $installer) -or -not (Test-Path $signature) -or -not (Test-Path $manifestPath)) { throw 'Release assets were not prepared.' }
-          "installer=$installer" >> $env:GITHUB_OUTPUT
-          "signature=$signature" >> $env:GITHUB_OUTPUT
-          "manifest=$manifestPath" >> $env:GITHUB_OUTPUT
+          $expected = @($assetName, "$assetName.sig", 'latest.json', $msi.Name)
+          foreach ($name in $expected) {
+            $assetPath = Join-Path $staging $name
+            if (-not (Test-Path $assetPath) -or (Get-Item $assetPath).Length -le 0) { throw "Release asset is missing or empty: $name" }
+          }
+          "staging=release-assets" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
       - uses: softprops/action-gh-release@v2
         with:
@@ -81,11 +88,30 @@ jobs:
           generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-beta.') }}
           body_path: .github/release-notes/v${{ steps.assets.outputs.version }}.md
-          files: |
-            ${{ steps.assets.outputs.installer }}
-            ${{ steps.assets.outputs.signature }}
-            ${{ steps.assets.outputs.manifest }}
-            src-tauri/target/release/bundle/msi/*.msi
+          files: release-assets/*
+          fail_on_unmatched_files: true
+      - name: Verify Windows release assets
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $version = [string]$config.version
+          $expected = @("Flux.Hands_${version}_x64-setup.exe", "Flux.Hands_${version}_x64-setup.exe.sig", 'latest.json', "Flux Hands_${version}_x64_en-US.msi")
+          $release = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$env:RELEASE_TAG" -Headers $headers
+          $assets = Invoke-RestMethod -Method Get -Uri $release.assets_url -Headers $headers
+          $names = $assets | ForEach-Object { $_.name }
+          $missing = $expected | Where-Object { $_ -notin $names }
+          if ($missing) { throw "Release is missing assets: $($missing -join ', ')" }
+          foreach ($name in $expected) {
+            $asset = $assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+            if ($asset.size -le 0) { throw "Release asset is empty: $name" }
+          }
+          Write-Host "Verified $($expected.Count) non-empty Windows installer/updater assets for $env:RELEASE_TAG."
       - name: Remove installers from older releases
         shell: pwsh
         env:
@@ -117,9 +143,13 @@ jobs:
         run: |
           set +o pipefail
           yes | sdkmanager --licenses
-      - name: Install Android SDK packages
+      - name: Install Android platform tools
+        run: sdkmanager --install --sdk_root="$ANDROID_HOME" 'platform-tools'
+      - name: Install Android API 37 and build tools
+        run: sdkmanager --install --sdk_root="$ANDROID_HOME" 'platforms;android-37' 'build-tools;36.0.0'
+      - name: Install Android NDK
         run: |
-          sdkmanager 'platform-tools' 'platforms;android-37' 'build-tools;36.0.0' 'ndk;27.2.12479018'
+          sdkmanager --install --sdk_root="$ANDROID_HOME" 'ndk;27.2.12479018'
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - name: Install frontend dependencies
         run: npm ci
@@ -141,3 +171,19 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           files: ${{ steps.android_asset.outputs.apk }}
+          fail_on_unmatched_files: true
+      - name: Verify Android APK release asset
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $expected = "Flux.Hands_$($env:RELEASE_TAG)_android-arm64-debug.apk"
+          $release = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$env:RELEASE_TAG" -Headers $headers
+          $assets = Invoke-RestMethod -Method Get -Uri $release.assets_url -Headers $headers
+          $apk = $assets | Where-Object { $_.name -eq $expected } | Select-Object -First 1
+          if (-not $apk -or $apk.size -le 0) { throw "Android APK release asset is missing or empty: $expected" }
+          Write-Host "Verified Android APK $expected ($($apk.size) bytes)."

@@ -24,7 +24,7 @@ $current = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$currentTag" 
 $releases = @()
 $page = 1
 do {
-    $batch = @(Invoke-RestMethod -Method Get -Uri "$base/releases?per_page=100&page=$page" -Headers $headers)
+    $batch = Invoke-RestMethod -Method Get -Uri "$base/releases?per_page=100&page=$page" -Headers $headers
     $releases += $batch
     $page++
 } while ($batch.Count -eq 100)
