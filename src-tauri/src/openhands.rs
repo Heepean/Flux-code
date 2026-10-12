@@ -775,9 +775,11 @@ pub fn stop_agent_server(state: State<'_, AgentServerState>) -> Result<(), Strin
 pub async fn send_agent_message(
     app: AppHandle,
     state: State<'_, AgentServerState>,
+    workspace_state: State<'_, WorkspaceState>,
     message: String,
     conversationId: Option<String>,
 ) -> Result<String, String> {
+    let _agent_workspace_guard = workspace_state.begin_agent_task()?;
     let (base, key, config) = {
         let port = state.port.lock().map_err(|error| error.to_string())?;
         let remote_base = state
@@ -807,6 +809,16 @@ pub async fn send_agent_message(
         (base, key, config)
     };
     let (workspace, provider, endpoint, model, api_key) = config;
+    let server_is_local = state
+        .remote_base
+        .lock()
+        .map_err(|error| error.to_string())?
+        .is_none();
+    if server_is_local && PathBuf::from(&workspace) != workspace_state.active_root()? {
+        return Err(
+            "Проект OpenHands изменился. Перезапустите Agent Server для текущей папки".into(),
+        );
+    }
     let model_id = if provider == "local" {
         "openai/local-model".to_string()
     } else {

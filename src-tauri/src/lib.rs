@@ -19,22 +19,54 @@ struct Runtime {
 }
 
 #[derive(Default)]
+struct WorkspaceInner {
+    root: Option<PathBuf>,
+    agent_busy: bool,
+}
+
+#[derive(Default)]
 pub struct WorkspaceState {
-    root: Mutex<Option<PathBuf>>,
+    inner: Mutex<WorkspaceInner>,
+}
+
+pub(crate) struct AgentWorkspaceGuard<'a> {
+    workspace: &'a WorkspaceState,
 }
 
 impl WorkspaceState {
     pub(crate) fn active_root(&self) -> Result<PathBuf, String> {
-        self.root
+        self.inner
             .lock()
             .map_err(|error| error.to_string())?
+            .root
             .clone()
             .ok_or_else(|| "Сначала откройте папку проекта".into())
     }
 
     fn set_root(&self, root: PathBuf) -> Result<(), String> {
-        *self.root.lock().map_err(|error| error.to_string())? = Some(root);
+        let mut state = self.inner.lock().map_err(|error| error.to_string())?;
+        if state.agent_busy {
+            return Err("Нельзя переключить проект, пока выполняется задача OpenHands".into());
+        }
+        state.root = Some(root);
         Ok(())
+    }
+
+    pub(crate) fn begin_agent_task(&self) -> Result<AgentWorkspaceGuard<'_>, String> {
+        let mut state = self.inner.lock().map_err(|error| error.to_string())?;
+        if state.agent_busy {
+            return Err("Задача OpenHands уже выполняется".into());
+        }
+        state.agent_busy = true;
+        Ok(AgentWorkspaceGuard { workspace: self })
+    }
+}
+
+impl Drop for AgentWorkspaceGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.workspace.inner.lock() {
+            state.agent_busy = false;
+        }
     }
 }
 
@@ -1319,7 +1351,7 @@ mod workspace_search_tests {
         checked_workspace_path, create_project_path, git_file_diff_for, git_status_for,
         ignored_search_directory, matching_lines, rollback_agent_file_change_for,
         search_workspace_files, terminate_process_tree, validate_search_query, AgentFileRollback,
-        StartModel,
+        StartModel, WorkspaceState,
     };
     use std::fs;
     use std::process::{Command, Stdio};
@@ -1483,6 +1515,33 @@ mod workspace_search_tests {
         assert_eq!(fs::read_to_string(&project_file).unwrap(), "before");
         assert_eq!(fs::read_to_string(&outside_file).unwrap(), "secret");
 
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn active_agent_task_blocks_workspace_switch_until_guard_drops() {
+        let parent = std::env::temp_dir().join(format!(
+            "flux-hands-workspace-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first = parent.join("first");
+        let second = parent.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first = fs::canonicalize(first).unwrap();
+        let second = fs::canonicalize(second).unwrap();
+        let state = WorkspaceState::default();
+        state.set_root(first.clone()).unwrap();
+
+        {
+            let _guard = state.begin_agent_task().unwrap();
+            assert!(state.begin_agent_task().is_err());
+            assert!(state.set_root(second.clone()).is_err());
+            assert_eq!(state.active_root().unwrap(), first);
+        }
+
+        state.set_root(second.clone()).unwrap();
+        assert_eq!(state.active_root().unwrap(), second);
         fs::remove_dir_all(parent).unwrap();
     }
 

@@ -7,6 +7,7 @@
 - OpenHands conversations now request confirmation before tool actions. The UI shows the tool name, risk value and serialized action, then lets the user approve or reject the pending batch. Existing conversations receive the policy update before new work is sent.
 - The native layer records the active project from the OS folder picker, persists that choice, and migrates the earlier saved path once. File listing, reading, writing, search, Git status, model downloads and local Agent Server startup use that native active root rather than trusting a root supplied with each UI request. Targets are canonicalized and paths outside the root (including resolved symlink targets) are rejected. The editor save command only updates an existing file.
 - On Windows, a regression test creates a directory junction from inside the workspace to an outside folder and confirms that the resolved path is rejected. Folder selection/creation now return paths without mutating active-root state; the frontend serializes activation against task sends.
+- The native workspace state now grants an RAII guard to each active agent request. While held, root changes and concurrent agent requests are rejected; local-agent sends also compare the server's configured workspace with the currently selected root. A Windows unit test covers lock acquisition, switch rejection and release.
 - Hugging Face download validates repository and relative GGUF path and avoids overwriting an existing model file.
 - Updater downloads use Tauri's signed updater mechanism; publishing requires CI signing secrets.
 
@@ -23,7 +24,7 @@
 ## Required security checks before public-ready status
 
 1. Exercise approve and reject against an OpenHands 1.26 Agent Server with a tool-capable mock model; verify no tool executes before approval.
-2. Verify project file operations reject `..`, absolute paths on another drive, symlinks/junctions to outside paths, and concurrent root changes. The Windows junction case is covered; the UI switch lock has not yet been exercised during a live desktop task, and direct IPC is not independently locked.
+2. Verify project file operations reject `..`, absolute paths on another drive, symlinks/junctions to outside paths, and concurrent root changes. Windows junction and backend active-agent lock unit cases pass; the switch-during-task scenario still needs a live native-window check.
 3. Verify the OpenHands runtime cannot read/write arbitrary files or run destructive commands without an approval; document that execution still uses the user's OS identity.
 4. Test secret storage on clean Windows and Android devices and inspect logs/UI for accidental credential disclosure.
 5. Test signed update verification and interrupted-update recovery from a published release.
