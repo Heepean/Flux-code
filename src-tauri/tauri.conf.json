@@ -27,7 +27,7 @@
     "active": true,
     "android": {
       "minSdkVersion": 35,
-      "versionCode": 1001009
+      "versionCode": 1001012
     },
     "createUpdaterArtifacts": true,
     "targets": [
