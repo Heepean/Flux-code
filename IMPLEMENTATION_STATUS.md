@@ -8,7 +8,7 @@ This file tracks the path to a dependable daily-use release. “Implemented” d
 | --- | --- | --- |
 | Reproducible frontend build | Verified in current audit | `npm run build` passed 2026-10-12 |
 | Windows installers | Stable v1.0.8 release page reports 6 assets; candidate beta.2 workflow is in progress | Verify exact installer/updater names, signatures and hashes after Actions run 38220704939; install and smoke test on clean Windows |
-| Android APK | No current candidate APK verified | Candidate beta.2 Android job runs after Windows release job; previous Android SDK setup failed. Verify APK signature, package metadata, hash, then install on Android 15+ |
+| Android APK | Local v1.0.15-beta.1 ARM64 release APK built and signed for testing | `artifacts/Flux.Hands_1.0.15-beta.1_android-arm64.apk`, 17,146,731 bytes; package `dev.fluxcode.fluxhands`, versionCode 1001015, minSdk 35; apksigner v3 verification passed; SHA-256 `5D787823827E2069B81D0B8940EF9563EB9AAB73A34BC2382490C30A1FE04549`. Signed with this machine's Android debug key; no device/emulator attached, and GitHub upload is pending authenticated push |
 | Open project and edit/save files | Implemented with explicit Save/Ctrl+S and dirty-tab indicator; build verified | Native desktop save, failed-save recovery, large/read-only files and external-change conflicts still need runtime checks |
 | Git change review | Per-file diff preview added for tracked and untracked text files | Rust tests cover staged, unstaged, untracked, spaced paths, and rejecting files outside the selected workspace; native panel remains visually unverified |
 | Create/switch projects | Implemented; Rust helper and browser-preview dialog checked | Rust test validates child-folder creation and rejects traversal; folder picker and project switching in native Tauri UI still need runtime verification |
@@ -20,7 +20,7 @@ This file tracks the path to a dependable daily-use release. “Implemented” d
 | Change diff and agent file-editor undo | Git diff plus guarded rollback for successful OpenHands file_editor changes implemented and unit-tested | Rollback checks workspace containment and current content against the recorded after-state; terminal effects, deletions/binary changes, and remote workspace rollback are not covered. File-editor history is persisted with each local chat transcript |
 | Error diagnostics and process cleanup | Partial | Windows process-tree regression test confirms wrapper cleanup; OpenHands interrupt endpoint/header pass HTTP mock coverage; live-agent cancellation and repeated launch remain unverified |
 | Data/history persistence | Partial | Project/chat/transcript/conversation IDs now persist in local storage; desktop reload/switch behavior and durable activity/approval journal need runtime verification |
-| Public release | v1.0.14-beta.2 workflow remains active without artifacts; latest public release is v1.0.8 | Actions run 38220704939 still reports In progress and no artifacts; no new installer/APK verified. beta.2 does not include later commits bfafbac, 90eaadd or f0fb1ad |
+| Public release | Latest listed public release remains v1.0.8; v1.0.15-beta.1 is local only | GitHub release page still lists v1.0.8. Local commit `e3806cf` contains the workflow fix and version bump; `git push origin main` fails because GitHub credentials are unavailable. The tag and APK have not been published |
 
 ## P1 — usability and reliability
 

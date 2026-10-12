@@ -16,14 +16,14 @@ Build a dependable Windows desktop workspace for projects, local GGUF models, re
 
 ## Current verified baseline (2026-10-12)
 
-- Desktop development app builds; Rust test suite passes 11 tests, including Windows child-process-tree cleanup and project-folder traversal rejection.
+- On 2026-10-12, the production frontend build, Rust formatting check, and all 15 Rust unit tests passed on local commit `e3806cf`.
 - A temporary GGUF model ran through the native llama.cpp process manager, answered a completion, and shut down. Larger user models still depend on available RAM/VRAM.
 - The app started OpenHands Agent Server 1.26.0 in a disposable workspace and completed a Kilo Free text task, including streamed UI events and clean server shutdown. A live `file_editor.create` action was displayed before execution: rejection kept the file absent, approval created the requested file, and the same conversation resumed after server restart.
 - That OpenHands startup logged a non-fatal browser-tool preload error (`Server.list_tools` missing); text tasks worked. A prior live dev-app scenario verified file-editor approval/rejection and conversation continuation; runtime workspace containment remains unverified.
 - A direct pinned OpenHands 1.26.0 request using the app's `openai/kilo-auto/free` model ID returned the expected Kilo response and finished; the full native UI flow still needs a desktop-window smoke test.
 - Project creation and per-project chats/transcripts are implemented; browser preview showed the open-existing/create-new dialog and new-chat entry. Native folder dialogs, project switching and chat reload/continuation still need UI runtime verification.
 - The editor now has explicit Save/Ctrl+S and dirty indicators; only the production frontend build has been verified for this change. Native editing, failed save and external-change scenarios remain pending.
-- Stable v1.0.8 currently reports six assets on its public release page. Candidate v1.0.14-beta.2 is running Actions workflow 38220704939 for commit 0634555; the current main source has advanced to bfafbac. Its Windows assets and Android APK must be verified after the workflow finishes. Clean Windows installation and physical Android 15+ launch remain unverified.
+- GitHub still lists v1.0.8 as the latest release. Local candidate v1.0.15-beta.1 has a verified, optimized Android ARM64 APK (signed with a local debug key; 17,146,731 bytes); package metadata and APK signature are valid, but device installation is unverified. The tag, APK, and workflow change are not published because the local GitHub session is unauthenticated. The updated workflow makes Windows and Android builds independent. Clean Windows installation and physical Android 15+ launch remain unverified; see the current [audit](PROJECT_AUDIT.md#follow-up-verification--2026-10-12).
 
 See [PROJECT_AUDIT.md](PROJECT_AUDIT.md) for evidence and limitations, and [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for release gates.
 

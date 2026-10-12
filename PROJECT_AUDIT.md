@@ -106,3 +106,13 @@ Local inference needs hardware/runtime; Kilo's anonymous free tier has upstream 
 ## Scope limits
 
 This audit reviewed source, CI/release status and artifacts, ran a real small-GGUF inference request through Tauri native commands, and exercised OpenHands 1.26.0 through the dev app in earlier approval scenarios and directly for the Kilo Auto Free model-path check. It did not install the official desktop release on a clean Windows PC, connect an Android device, exercise the new project/chat UI in a desktop window, or conduct a security penetration test. Statuses must be updated when those checks are carried out.
+
+## Follow-up verification — 2026-10-12
+
+- Current source is local commit `e3806cf` (`Publish Android APK independently in v1.0.15`), based on `e948379`. It is one commit ahead of `origin/main`; the annotated tag `v1.0.15-beta.1` exists locally but neither commit nor tag has been pushed because GitHub credentials are unavailable in this environment.
+- GitHub's public Releases page was rechecked: v1.0.8 remains the newest listed release. No v1.0.15-beta.1 release or APK is public yet.
+- The release workflow now creates a release entry first and makes Android and Windows build jobs independent. This workflow change is in the unpushed commit; no hosted Actions run has validated it.
+- `npm run build`, `cargo fmt --check --manifest-path src-tauri/Cargo.toml`, and `cargo test --manifest-path src-tauri/Cargo.toml` passed on this source; 15 Rust tests passed.
+- The optimized Android ARM64 release APK was built from the current v1.0.15 source. Tauri's Windows CLI compiled the Android Rust library, then stopped because Windows denied symlink creation; copying that compiled `.so` into generated `jniLibs` and running Gradle `:app:assembleArm64Release` completed successfully. The unsigned APK was signed with the local Android debug keystore for testing. The delivered artifact is 17,146,731 bytes; package `dev.fluxcode.fluxhands`, version `1.0.15`, versionCode `1001015`, minSdk 35; `apksigner verify` passed. SHA-256: `5D787823827E2069B81D0B8940EF9563EB9AAB73A34BC2382490C30A1FE04549`.
+- No Android device or emulator is attached; installation and runtime behavior are unverified. The local debug signing key is not the production updater or a durable release signing key. Windows installers for v1.0.15 have not been built or published.
+- Android local-build output and signed APK are in the ignored generated Android tree and untracked `artifacts/` directory respectively; the APK is not committed to source.
