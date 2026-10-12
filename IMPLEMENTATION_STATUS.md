@@ -11,8 +11,8 @@ This file tracks the path to a dependable daily-use release. “Implemented” d
 | Android APK | Built and package metadata/signature checked; runtime unverified | v1.0.13 ARM64 debug APK; install and smoke test on Android 15+ device |
 | Open project and edit/save files | Implemented; runtime verification pending | Run scenario on clean supported Windows; test read-only, large, external-change and failed-save cases |
 | Local GGUF model flow | Partially verified through dev app | Tauri native command loaded temporary 1B GGUF, health/chat passed, stop killed server; user 8B model refused due RAM. Verify selected full-size model on suitable hardware |
-| OpenHands model/task flow | Implemented; end-to-end verification pending | Test local runtime and remote server with tool-capable model |
-| Agent action approval | Implemented in code; runtime proof pending | `AlwaysConfirm`, pending-action display and approve/reject endpoint; test against OpenHands 1.26 and verify fail-closed behavior |
+| OpenHands model/task flow | Partially verified end to end | Dev app started OpenHands 1.26.0 in isolated workspace and received Kilo Free completion/events; tool actions, approval, conversation continuation and other providers still need runtime tests |
+| Agent action approval | Implemented in code; runtime proof pending | `AlwaysConfirm`, pending-action display and approve/reject endpoint; confirm no tool runs before approval and verify accept/reject against OpenHands 1.26 |
 | Workspace access boundary | Implemented for native commands; incomplete for runtime | Native selected root, rootless IPC for file/search/Git/model download, canonical target checks; cover Windows junction/race cases and OpenHands tool sandbox separately |
 | Change diff and real undo | Missing | Implement captured before-state/diff and rollback |
 | Error diagnostics and process cleanup | Partial | Some errors shown and child processes stopped on exit; test crashes, startup timeout, cancellation and repeated launch |
@@ -27,6 +27,7 @@ This file tracks the path to a dependable daily-use release. “Implemented” d
 - Unified provider configuration with request timeout, cancellation and bounded retries.
 - Privacy/data destination and paid-provider cost notices at the point of use.
 - Repeatable integration test suite including offline and failure cases.
+- Investigate non-fatal OpenHands 1.26.0 browser-tool preload error (`Server.list_tools` missing); the agent server still becomes ready and text tasks succeed.
 - Clean-system installer and updater validation.
 
 ## P2 — expansion after P0/P1

@@ -25,8 +25,8 @@ No embedded VS Code or OpenHands source tree is present in this checkout. The ap
 | Git branch/status and changed file opening | Implemented (read-only status) | Rust temp-repository test passes |
 | Local GGUF launch/switch | Implemented with CPU runtime bootstrap, RAM check and one child process | Real small GGUF loaded through native app commands; health and chat passed, then stop closed the port. Full user models are refused on this machine's available RAM |
 | Hugging Face model search/download | Implemented for desktop | Source reviewed; no network/download scenario run here |
-| OpenHands local/remote task execution | Implemented using API/event polling | Source reviewed; no real Agent Server/provider end-to-end scenario in this audit |
-| Kilo free catalog | Implemented against live Kilo endpoint | Source reviewed; no live-provider task run here |
+| OpenHands local/remote task execution | Implemented using API/event polling | Dev app started OpenHands Agent Server 1.26.0 in an isolated temporary workspace and received a real Kilo Free completion plus streamed events; see findings |
+| Kilo free catalog | Implemented against live Kilo endpoint | Anonymous Kilo Free request through OpenHands 1.26.0 returned `FLUX_OPENHANDS_OK`; tool-capable action flow and approval still need verification |
 | Android remote agent flow | Implemented | 1.0.13 ARM64 debug APK built; signature and package metadata checked; no phone/emulator attached, so not installed/launched |
 | Auto-update | Configured for GitHub Releases, signed updater manifest expected | Not exercised against a published release; local Windows installers lack updater signatures |
 | Change diff, undo/rollback, terminal panel, risky-action approval | Not implemented in UI | Confirmed by source review; see critical issues |
@@ -36,15 +36,19 @@ No embedded VS Code or OpenHands source tree is present in this checkout. The ap
 
 ### P0 — Agent action confirmation needs real runtime proof
 
-The source originally sent `NeverConfirm`. This turn changed new conversations to `AlwaysConfirm`, updates reused conversations through the Agent Server confirmation-policy endpoint, polls pending ActionEvents, and presents their tool/action details with explicit approve/reject controls. Rejecting an action reports that the OpenHands run stopped (the pinned API transitions the conversation to idle). Rust tests and frontend build pass, but an end-to-end test with OpenHands 1.26 has not yet proven that no tool runs before approval or that approval/rejection works in a live run. Diff and undo are still absent. Do not claim the action safety flow verified until the runtime scenario passes.
+The source originally sent `NeverConfirm`. New conversations use `AlwaysConfirm`; reused conversations call the Agent Server confirmation-policy endpoint, poll pending ActionEvents and present tool/action details with explicit approve/reject controls. Rejecting an action reports that the OpenHands run stopped (the pinned API transitions the conversation to idle). A dev-app E2E test now proves Agent Server 1.26.0 startup, a Kilo Free response, event delivery and clean shutdown. During that test, OpenHands logged a non-fatal browser-tool preload error (`AttributeError: 'Server' object has no attribute 'list_tools'`) and then reported the application ready; chat completed. Still unverified: that no tool executes before approval and that approve/reject works in a live tool run. Diff and undo are absent.
 
 ### P0 — Workspace boundary only covers Flux Hands file commands
 
 Desktop native state records the active root from the OS folder picker and persists it; workspace file/list/search/Git/model-download commands no longer accept a caller-supplied root. Targets are canonicalized and rejected outside that active root, and editor saves only affect existing files. Unit coverage verifies that a sibling path and a symlink escape are rejected where symlinks are supported. Windows junction escape and root-switch races still need coverage. This does not sandbox OpenHands' independent runtime or terminal tool; test and document that boundary separately.
 
+### P0 — Tauri command argument casing broke agent conversation continuation
+
+`send_agent_message` and `respond_to_agent_confirmation` declared Rust `conversation_id`, but the UI sends Tauri arguments as `conversationId`. That meant the first message path omitted the optional field harmlessly, while continuing an existing conversation and responding to approval could fail argument decoding. The commands now accept the frontend camelCase spelling. A real Agent Server message invocation using `conversationId: null` succeeded after this fix; continuation and approval endpoints still need a dedicated live test.
+
 ### P0 — Local model command mismatch fixed; broad provider verification remains
 
-The UI sent camelCase `modelPath` and `gpuLayers` to `start_local_model`; Rust expected snake_case in the nested struct, so UI-triggered GGUF startup failed before spawning the server. `StartModel` now deserializes camelCase and a regression test covers this. The dev app's native command was re-run successfully with a temporary 1B model. Live OpenHands/provider integration remains unverified.
+The UI sent camelCase `modelPath` and `gpuLayers` to `start_local_model`; Rust expected snake_case in the nested struct, so UI-triggered GGUF startup failed before spawning the server. `StartModel` now deserializes camelCase and a regression test covers this. The dev app's native command was re-run successfully with a temporary 1B model. Kilo was also verified through the local OpenHands server; other providers and full-size local models remain hardware/provider dependent.
 
 ### P1 — UI state persistence is incomplete
 
@@ -75,6 +79,8 @@ Local inference needs hardware/runtime; Kilo's anonymous free tier has upstream 
 - Android ARM64 debug APK built locally at `src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk` (SHA256 `E2AC4B5C84AA7023C801B8235D1D7D46E1B480A289361137653AF9C9265E2A9B`); apksigner v2 verification and package/version metadata passed. No Android device/emulator was attached.
 - llama.cpp CPU b11429 archive SHA-256 matched upstream GitHub attestation; temporary Llama 3.2 1B Q4_K_M model SHA-256 matched Hugging Face metadata. Dev app returned `FLUX_TAURI_OK` through its native local-model flow.
 - Nemotron-Cascade-8B-Q6_K was rejected before spawn: about 5.0 GB RAM free vs. about 8.3 GB required.
+- Local Agent Server E2E: app launched pinned OpenHands 1.26.0 against a disposable workspace, Kilo Free returned `FLUX_OPENHANDS_OK`, events carried the conversation ID and terminal status, and `stop_agent_server` completed. The original workspace configuration was restored after the test.
+- This OpenHands startup produced a non-fatal browser tool preload error (`Server.list_tools` missing); server reached ready state and the no-tools response succeeded. Browser automation tools may be unavailable until the upstream dependency mismatch is resolved.
 - GitHub beta.3 has signed Windows assets. Its Android job failed at SDK setup; the separated license/package steps have not yet run in CI.
 - Clean-machine installed-app smoke test: not performed.
 

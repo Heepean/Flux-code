@@ -762,11 +762,12 @@ pub fn stop_agent_server(state: State<'_, AgentServerState>) -> Result<(), Strin
 }
 
 #[tauri::command]
+#[allow(non_snake_case)]
 pub async fn send_agent_message(
     app: AppHandle,
     state: State<'_, AgentServerState>,
     message: String,
-    conversation_id: Option<String>,
+    conversationId: Option<String>,
 ) -> Result<String, String> {
     let (base, key, config) = {
         let port = state.port.lock().map_err(|error| error.to_string())?;
@@ -808,7 +809,7 @@ pub async fn send_agent_message(
         .map_err(|error| error.to_string())?;
     let base = format!("{base}/api/conversations");
     let headers = [("X-Session-API-Key", key)];
-    let mut conversation_id = conversation_id;
+    let mut conversation_id = conversationId;
     if let Some(id) = conversation_id.as_deref() {
         let conversation = client
             .get(format!("{base}/{id}"))
@@ -1200,12 +1201,13 @@ pub async fn send_agent_message(
 }
 
 #[tauri::command]
+#[allow(non_snake_case)]
 pub async fn respond_to_agent_confirmation(
     state: State<'_, AgentServerState>,
-    conversation_id: String,
+    conversationId: String,
     accept: bool,
 ) -> Result<(), String> {
-    let conversation_id = Uuid::parse_str(&conversation_id)
+    let conversation_id = Uuid::parse_str(&conversationId)
         .map_err(|_| "ID разговора OpenHands имеет неверный формат".to_owned())?;
     let (base, key) = {
         let port = state.port.lock().map_err(|error| error.to_string())?;

@@ -18,6 +18,12 @@
 - Project selection persists in native configuration and migrates the workspace choice from earlier versions.
 # История изменений
 
+## v1.0.14
+
+- Исправлена сериализация camelCase аргументов локальной модели и conversation ID в Tauri-командах OpenHands.
+- Подтверждён реальный сценарий OpenHands Agent Server 1.26.0 + Kilo Free через dev-приложение в изолированной рабочей папке.
+- Описан некритичный сбой предзагрузки browser tool в bundled OpenHands runtime; текстовый сценарий продолжает работать.
+
 ## v1.0.12
 
 - Добавлена панель Git с текущей веткой, списком изменённых и новых файлов и открытием файла в редакторе.
