@@ -185,6 +185,7 @@ jobs:
     needs: [prepare_release, release, android]
     runs-on: windows-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Verify both platform assets and publish release
         shell: pwsh
         env:
