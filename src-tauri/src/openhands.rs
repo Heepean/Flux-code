@@ -518,38 +518,7 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
 
 fn completion_text(value: &serde_json::Value) -> Result<String, String> {
     if let Some(error) = value.get("error") {
-        let message = error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| error.as_str())
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or("провайдер не указал причину");
-        let nested = error
-            .pointer("/metadata/previous_errors/0/raw")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                let raw = error.pointer("/metadata/raw")?.as_str()?;
-                let raw: serde_json::Value = serde_json::from_str(raw).ok()?;
-                raw.get("message")?.as_str().map(str::to_owned)
-            })
-            .filter(|detail| !detail.trim().is_empty() && !message.contains(detail.as_str()));
-        let detail = if let Some(nested) = nested {
-            format!("{message}: {nested}")
-        } else {
-            message.to_owned()
-        };
-        let detail = detail.chars().take(512).collect::<String>();
-        let code = error
-            .get("code")
-            .map(|code| match code {
-                serde_json::Value::String(code) => code.clone(),
-                _ => code.to_string(),
-            })
-            .filter(|code| !code.is_empty() && code != "null")
-            .map(|code| format!(" ({code})"))
-            .unwrap_or_default();
-        return Err(format!("Ошибка удалённого провайдера{code}: {detail}"));
+        return Err(provider_error_message(error));
     }
     let content = value
         .pointer("/choices/0/message/content")
@@ -569,6 +538,93 @@ fn completion_text(value: &serde_json::Value) -> Result<String, String> {
     Err("Модель вернула ответ без поддерживаемого текстового содержимого".into())
 }
 
+fn provider_error_message(error: &serde_json::Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("провайдер не указал причину");
+    let nested = error
+        .pointer("/metadata/previous_errors/0/raw")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or_else(|| Some(raw.to_owned()))
+        })
+        .or_else(|| {
+            let raw = error.pointer("/metadata/raw")?.as_str()?;
+            let raw: serde_json::Value = serde_json::from_str(raw).ok()?;
+            raw.get("message")?.as_str().map(str::to_owned)
+        })
+        .filter(|detail| !detail.trim().is_empty() && !message.contains(detail.as_str()));
+    let detail = nested.map_or_else(
+        || message.to_owned(),
+        |nested| format!("{message}: {nested}"),
+    );
+    let detail = detail.chars().take(512).collect::<String>();
+    let code = error
+        .get("code")
+        .map(|code| match code {
+            serde_json::Value::String(code) => code.clone(),
+            _ => code.to_string(),
+        })
+        .filter(|code| !code.is_empty() && code != "null")
+        .map(|code| format!(" ({code})"))
+        .unwrap_or_default();
+    format!("Ошибка удалённого провайдера{code}: {detail}")
+}
+
+fn is_rate_limit_failure(status: reqwest::StatusCode, body: &[u8]) -> bool {
+    if status.as_u16() == 429 {
+        return true;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let code = value.pointer("/error/code");
+    code.is_some_and(|code| code.as_u64() == Some(429) || code.as_str() == Some("429"))
+        || value
+            .pointer("/error/metadata/raw")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|raw| raw.contains("RATE_LIMIT_EXCEEDED"))
+}
+
+fn rate_limit_error_from_text(error: &str) -> bool {
+    error.contains("HTTP 429")
+        || error.contains("провайдера (429)")
+        || error.contains("RATE_LIMIT_EXCEEDED")
+}
+
+fn unique_fallback_models(
+    selected: &str,
+    candidates: &[String],
+    require_tools: bool,
+) -> Vec<String> {
+    let mut models = vec![selected.to_owned()];
+    for candidate in candidates {
+        let candidate = candidate.trim();
+        if candidate.is_empty()
+            || candidate == selected
+            || models.iter().any(|item| item == candidate)
+        {
+            continue;
+        }
+        models.push(candidate.to_owned());
+        if models.len() == if require_tools { 3 } else { 4 } {
+            break;
+        }
+    }
+    models
+}
+
 #[tauri::command]
 pub async fn send_direct_model_message(
     state: State<'_, DirectModelState>,
@@ -576,6 +632,7 @@ pub async fn send_direct_model_message(
     model: String,
     endpoint: String,
     api_key: Option<String>,
+    fallback_models: Vec<String>,
     messages: Vec<DirectChatMessage>,
 ) -> Result<String, String> {
     let provider = provider.trim().to_ascii_lowercase();
@@ -631,14 +688,25 @@ pub async fn send_direct_model_message(
         }
         (base, api_key)
     };
-    send_openai_compatible_chat(
-        Arc::clone(&state.generation),
-        base,
-        model,
-        request_messages,
-        api_key,
-    )
-    .await
+    if provider == "kilo" {
+        send_kilo_chat_with_fallback(
+            Arc::clone(&state.generation),
+            base,
+            model,
+            unique_fallback_models(model, &fallback_models, false),
+            request_messages,
+        )
+        .await
+    } else {
+        send_openai_compatible_chat(
+            Arc::clone(&state.generation),
+            base,
+            model,
+            request_messages,
+            api_key,
+        )
+        .await
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -659,6 +727,8 @@ pub struct DirectAgentRequest {
     model: String,
     endpoint: String,
     api_key: Option<String>,
+    #[serde(default)]
+    fallback_models: Vec<String>,
     messages: Vec<DirectChatMessage>,
     allow_project_access: bool,
 }
@@ -754,6 +824,7 @@ pub async fn send_direct_model_agent(
             root,
             base,
             model.to_owned(),
+            unique_fallback_models(model, &request.fallback_models, provider == "kilo"),
             api_key,
             request_messages,
             emitter,
@@ -773,11 +844,13 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_direct_agent_loop<F>(
     state: &DirectModelState,
     root: PathBuf,
     base: String,
     model: String,
+    fallback_models: Vec<String>,
     api_key: String,
     mut request_messages: Vec<serde_json::Value>,
     emitter: DirectAgentEventEmitter<F>,
@@ -795,16 +868,33 @@ where
     let mut file_changes = Vec::new();
     let mut tool_call_count = 0usize;
     for _ in 0..16 {
-        let value = request_direct_agent_completion(
+        let value = request_direct_agent_completion_with_fallback(
             &client,
             &base,
             &model,
+            &fallback_models,
             &request_messages,
             &api_key,
             &generation_state,
             generation,
         )
         .await?;
+        if let Some(fallback_model) = value
+            .get("_flux_fallback_model")
+            .and_then(serde_json::Value::as_str)
+        {
+            let _ = emitter.emit(DirectAgentEvent {
+                delta: String::new(),
+                done: false,
+                conversation_id: None,
+                error: None,
+                status: Some(format!(
+                    "Основная модель Kilo временно ограничена; переключился на {fallback_model}"
+                )),
+                pending_approvals: None,
+                file_changes: None,
+            });
+        }
         let message = value
             .pointer("/choices/0/message")
             .cloned()
@@ -976,14 +1066,74 @@ async fn request_direct_agent_completion(
         }
         body.extend_from_slice(&chunk);
     }
+    let rate_limited = is_rate_limit_failure(status, &body);
     if !status.is_success() {
-        return Err(format!(
-            "Провайдер вернул HTTP {status}: {}",
-            String::from_utf8_lossy(&body)
-        ));
+        return Err(format_http_provider_error(status, &body));
     }
-    serde_json::from_slice(&body)
-        .map_err(|error| format!("Провайдер вернул некорректный JSON: {error}"))
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("Провайдер вернул некорректный JSON: {error}"))?;
+    if let Some(error) = value.get("error") {
+        let message = provider_error_message(error);
+        return Err(if rate_limited && !rate_limit_error_from_text(&message) {
+            format!("HTTP 429: {message}")
+        } else {
+            message
+        });
+    }
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_direct_agent_completion_with_fallback(
+    client: &reqwest::Client,
+    base: &str,
+    selected_model: &str,
+    models: &[String],
+    messages: &[serde_json::Value],
+    api_key: &str,
+    generation_state: &AtomicU64,
+    generation: u64,
+) -> Result<serde_json::Value, String> {
+    let mut last_error = "Kilo не вернул ответ".to_owned();
+    for (index, model) in models.iter().take(3).enumerate() {
+        if index > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                _ = wait_for_direct_request_cancel(generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
+            }
+        }
+        match request_direct_agent_completion(
+            client,
+            base,
+            model,
+            messages,
+            api_key,
+            generation_state,
+            generation,
+        )
+        .await
+        {
+            Ok(mut value) => {
+                if model != selected_model {
+                    value["_flux_fallback_model"] = serde_json::Value::String(model.clone());
+                }
+                return Ok(value);
+            }
+            Err(error) if rate_limit_error_from_text(&error) && index + 1 < models.len() => {
+                last_error = error;
+            }
+            Err(error) => {
+                return Err(if rate_limit_error_from_text(&error) {
+                    format!("Бесплатная модель Kilo временно ограничена. Попробуйте ещё раз через минуту или выберите другую бесплатную модель в настройках. ({error})")
+                } else {
+                    error
+                })
+            }
+        }
+    }
+    Err(format!(
+        "Доступные бесплатные модели Kilo сейчас ограничены по частоте. Повторите задачу через минуту. ({last_error})"
+    ))
 }
 
 fn direct_agent_target(root: &Path, relative: &str, must_exist: bool) -> Result<PathBuf, String> {
@@ -1292,11 +1442,36 @@ async fn send_openai_compatible_chat(
     api_key: String,
 ) -> Result<String, String> {
     let generation = generation_state.fetch_add(1, Ordering::SeqCst) + 1;
-    let client = reqwest::Client::builder()
+    let client = build_direct_model_client()?;
+    send_openai_compatible_chat_attempt(
+        &client,
+        &base,
+        model,
+        &messages,
+        &api_key,
+        &generation_state,
+        generation,
+    )
+    .await
+}
+
+fn build_direct_model_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(180))
         .build()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())
+}
+
+async fn send_openai_compatible_chat_attempt(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    api_key: &str,
+    generation_state: &AtomicU64,
+    generation: u64,
+) -> Result<String, String> {
     let mut request = client
         .post(format!("{base}/chat/completions"))
         .json(&serde_json::json!({
@@ -1310,21 +1485,97 @@ async fn send_openai_compatible_chat(
     let response = tokio::select! {
         response = request.send() => response
             .map_err(|error| format!("Не удалось подключиться к модели: {error}"))?,
-        _ = wait_for_direct_request_cancel(&generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
+        _ = wait_for_direct_request_cancel(generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
     };
     let status = response.status();
     let body = tokio::select! {
         body = response.bytes() => body
             .map_err(|error| format!("Не удалось прочитать ответ модели: {error}"))?,
-        _ = wait_for_direct_request_cancel(&generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
+        _ = wait_for_direct_request_cancel(generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
     };
+    let rate_limited = is_rate_limit_failure(status, &body);
     if !status.is_success() {
-        let detail = String::from_utf8_lossy(&body);
-        return Err(format!("Провайдер вернул HTTP {status}: {detail}"));
+        return Err(format_http_provider_error(status, &body));
     }
     let value: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|error| format!("Провайдер вернул некорректный JSON: {error}"))?;
-    completion_text(&value)
+    completion_text(&value).map_err(|error| {
+        if rate_limited && !rate_limit_error_from_text(&error) {
+            format!("HTTP 429: {error}")
+        } else {
+            error
+        }
+    })
+}
+
+async fn send_kilo_chat_with_fallback(
+    generation_state: Arc<AtomicU64>,
+    base: String,
+    selected_model: &str,
+    models: Vec<String>,
+    messages: Vec<serde_json::Value>,
+) -> Result<String, String> {
+    let generation = generation_state.fetch_add(1, Ordering::SeqCst) + 1;
+    let client = build_direct_model_client()?;
+    let mut last_error = "Kilo не вернул ответ".to_owned();
+    let mut candidates = vec![selected_model.to_owned()];
+    candidates.extend(
+        models
+            .into_iter()
+            .filter(|model| model != selected_model)
+            .take(3),
+    );
+    for (index, model) in candidates.iter().enumerate() {
+        if index > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                _ = wait_for_direct_request_cancel(&generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
+            }
+        }
+        match send_openai_compatible_chat_attempt(
+            &client,
+            &base,
+            model,
+            &messages,
+            "",
+            &generation_state,
+            generation,
+        )
+        .await
+        {
+            Ok(answer) if index == 0 => return Ok(answer),
+            Ok(answer) => {
+                return Ok(format!(
+                    "[Основная модель Kilo временно ограничена; ответ получен от бесплатной модели {model}.]\n\n{answer}"
+                ))
+            }
+            Err(error) if rate_limit_error_from_text(&error) && index + 1 < candidates.len() => {
+                last_error = error;
+            }
+            Err(error) => return Err(if rate_limit_error_from_text(&error) {
+                format!("Бесплатная модель Kilo временно ограничена. Попробуйте ещё раз через минуту или выберите другую бесплатную модель в настройках. ({error})")
+            } else {
+                error
+            }),
+        }
+    }
+    Err(format!(
+        "Доступные бесплатные модели Kilo сейчас ограничены по частоте. Повторите запрос через минуту. ({last_error})"
+    ))
+}
+
+fn format_http_provider_error(status: reqwest::StatusCode, body: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(error) = value.get("error") {
+            return format!(
+                "Провайдер вернул HTTP {status}: {}",
+                provider_error_message(error)
+            );
+        }
+    }
+    let mut detail = String::from_utf8_lossy(body).into_owned();
+    truncate_utf8(&mut detail, 512);
+    format!("Провайдер вернул HTTP {status}: {detail}")
 }
 
 async fn wait_for_direct_request_cancel(generation_state: &AtomicU64, generation: u64) {
@@ -2593,6 +2844,68 @@ mod tests {
     }
 
     #[test]
+    fn kilo_rate_limit_automatically_uses_a_free_fallback_model() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        tauri::async_runtime::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let mut models = Vec::new();
+                for (expected_model, response) in [
+                    (
+                        "kilo-auto/free",
+                        r#"{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"{\"code\":429,\"reason\":\"RATE_LIMIT_EXCEEDED\",\"message\":\"temporarily rate-limited\"}"},"user_id":"org_private_gateway_id"}}"#,
+                    ),
+                    (
+                        "provider/available:free",
+                        r#"{"choices":[{"message":{"content":"Fallback response"}}]}"#,
+                    ),
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = vec![0_u8; 16_384];
+                    let count = stream.read(&mut request).unwrap();
+                    let request = String::from_utf8_lossy(&request[..count]);
+                    let body: serde_json::Value =
+                        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                    models.push(body["model"].as_str().unwrap().to_owned());
+                    assert_eq!(body["model"], expected_model);
+                    let status = if expected_model == "kilo-auto/free" {
+                        "429 Too Many Requests"
+                    } else {
+                        "200 OK"
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .unwrap();
+                }
+                models
+            });
+            let answer = super::send_kilo_chat_with_fallback(
+                Arc::new(AtomicU64::new(0)),
+                format!("http://{address}/v1"),
+                "kilo-auto/free",
+                vec!["kilo-auto/free".into(), "provider/available:free".into()],
+                vec![serde_json::json!({"role":"user","content":"hello"})],
+            )
+            .await
+            .unwrap();
+            assert!(answer.contains("provider/available:free"));
+            assert!(answer.contains("Fallback response"));
+            assert!(!answer.contains("org_private_gateway_id"));
+            assert_eq!(
+                server.join().unwrap(),
+                ["kilo-auto/free", "provider/available:free"]
+            );
+        });
+    }
+
+    #[test]
     fn direct_model_response_extracts_text_blocks() {
         let response = serde_json::json!({"choices":[{"message":{"content":[
             {"type":"text","text":"first "},
@@ -3020,6 +3333,7 @@ mod tests {
                     task_root,
                     format!("http://{address}/v1"),
                     "test-model".into(),
+                    vec!["test-model".into()],
                     String::new(),
                     vec![serde_json::json!({"role":"user","content":"Create created.txt"})],
                     DirectAgentEventEmitter(move |event| {

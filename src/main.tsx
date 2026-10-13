@@ -88,13 +88,14 @@ const deleteChat=(id:string)=>{if(busyRef.current||workspaceSwitchLock.current){
    if(provider==='remote'&&isDesktop&&remoteApiKey.trim()){await invoke('save_model_provider_key',{apiKey:remoteApiKey.trim()});setRemoteKeySaved(true);setRemoteApiKey('')}
    setStatus('Отправляю запрос удалённой модели…');
    const model=selectedModel;
+   const availableKiloModels=provider==='kilo'&&kiloModels.length===0?await invoke<KiloModel[]>('fetch_kilo_free_models').then(found=>{setKiloModels(found);return found}).catch(error=>{setStatus(`Не удалось загрузить каталог бесплатных моделей для повтора: ${String(error)}`);return []}):kiloModels;
    const chatMessages=[...messages.filter(item=>item.text.trim()).slice(-39).map(item=>({role:item.role,content:item.text})),{role:'user',content:text}];
    if(isDesktop&&remoteWorkspaceAccess&&(provider==='remote'||kiloModels.find(item=>item.id===model)?.supportsTools)){
     const unlisten=await listen<AgentEvent>('direct-agent-event',event=>{const value=event.payload;if(value.delta)setMessages(current=>{const next=[...current];const last=next.at(-1);if(last?.role==='assistant')next[next.length-1]={...last,text:last.text+value.delta};return next});if(value.file_changes)setAgentFileChanges(current=>{const byId=new Map(current.map(change=>[change.id,change]));for(const change of value.file_changes||[])byId.set(change.id,change);return [...byId.values()]});if(value.pending_approvals){setPendingApprovals(value.pending_approvals);setStatus('Удалённый агент ждёт подтверждения действия')}if(value.done){setPendingApprovals([]);setStatus(value.status||'Удалённая задача завершена')}});
-    try{answer=await invoke<string>('send_direct_model_agent',{request:{provider,model,endpoint:remoteEndpoint,apiKey:null,messages:chatMessages,allowProjectAccess:true}})}finally{unlisten()}
+    try{answer=await invoke<string>('send_direct_model_agent',{request:{provider,model,endpoint:remoteEndpoint,apiKey:null,fallbackModels:provider==='kilo'?availableKiloModels.filter(item=>item.supportsTools&&item.id!==model).map(item=>item.id):[],messages:chatMessages,allowProjectAccess:true}})}finally{unlisten()}
     setStatus('Ответ удалённого агента получен · без Agent Server');
    }else{
-    answer=await invoke<string>('send_direct_model_message',{provider,model,endpoint:remoteEndpoint,apiKey:isAndroid?remoteApiKey:null,messages:chatMessages});
+    answer=await invoke<string>('send_direct_model_message',{provider,model,endpoint:remoteEndpoint,apiKey:isAndroid?remoteApiKey:null,fallbackModels:provider==='kilo'?availableKiloModels.filter(item=>item.id!==model).map(item=>item.id):[],messages:chatMessages});
     setStatus('Ответ удалённой модели получен · без Agent Server');
    }
   }else if(isDesktop&&provider==='local'&&activeModel){

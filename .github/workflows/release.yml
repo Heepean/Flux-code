@@ -51,12 +51,15 @@ jobs:
         with:
           workspaces: src-tauri -> target
       - run: npm ci
-      - name: Verify Rust formatting, lint and tests
+      - name: Check Rust formatting
         working-directory: src-tauri
-        run: |
-          cargo fmt --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test
+        run: cargo fmt --check
+      - name: Run strict Rust Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test
       - name: Verify updater signing secrets
         shell: pwsh
         env:
