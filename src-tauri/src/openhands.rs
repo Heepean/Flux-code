@@ -517,6 +517,24 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
 }
 
 fn completion_text(value: &serde_json::Value) -> Result<String, String> {
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| error.as_str())
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("провайдер не указал причину");
+        let code = error
+            .get("code")
+            .map(|code| match code {
+                serde_json::Value::String(code) => code.clone(),
+                _ => code.to_string(),
+            })
+            .filter(|code| !code.is_empty() && code != "null")
+            .map(|code| format!(" ({code})"))
+            .unwrap_or_default();
+        return Err(format!("Ошибка удалённого провайдера{code}: {message}"));
+    }
     let content = value
         .pointer("/choices/0/message/content")
         .ok_or("Модель вернула ответ без текста")?;
@@ -2565,6 +2583,19 @@ mod tests {
             {"type":"text","text":"second"}
         ]}}]});
         assert_eq!(completion_text(&response).unwrap(), "first second");
+    }
+
+    #[test]
+    fn direct_model_response_surfaces_provider_errors_even_with_http_200() {
+        let response = serde_json::json!({
+            "error": {
+                "message": "Upstream error from Nvidia: Service temporarily overloaded",
+                "code": 503
+            }
+        });
+        let error = completion_text(&response).unwrap_err();
+        assert!(error.contains("503"));
+        assert!(error.contains("Service temporarily overloaded"));
     }
 
     #[test]
