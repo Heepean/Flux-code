@@ -48,7 +48,7 @@ jobs:
             "Flux.Hands_${version}_x64-setup.exe"
             "Flux.Hands_${version}_x64-setup.exe.sig"
             "latest.json"
-            "Flux Hands_${version}_x64_en-US.msi"
+            "Flux.Hands_${version}_x64_en-US.msi"
             "Flux.Hands_${release_tag}_android-arm64-debug.apk"
           )
           names=$(jq -r '.assets[].name' <<<"$release_json")

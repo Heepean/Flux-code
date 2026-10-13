@@ -152,7 +152,7 @@ jobs:
           $signature = "$installer.sig"
           Copy-Item $source.FullName $installer
           Copy-Item $sourceSig $signature
-          $releaseMsiName = "Flux Hands_${version}_x64_en-US.msi"
+          $releaseMsiName = "Flux.Hands_${version}_x64_en-US.msi"
           Copy-Item $msi.FullName (Join-Path $staging $releaseMsiName)
           $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG"
           $manifest = @{
@@ -275,7 +275,7 @@ jobs:
             'latest.json',
             "Flux.Hands_$($env:RELEASE_TAG)_android-arm64-debug.apk"
           )
-          $msiName = "Flux Hands_${version}_x64_en-US.msi"
+          $msiName = "Flux.Hands_${version}_x64_en-US.msi"
           $release = Invoke-RestMethod -Method Get -Uri "$base/releases/$env:RELEASE_ID" -Headers $headers
           if ($release.tag_name -ne $env:RELEASE_TAG -or -not $release.draft) { throw 'The expected GitHub draft release was not found.' }
           $assets = @($release.assets)
