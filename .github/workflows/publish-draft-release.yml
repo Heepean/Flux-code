@@ -21,15 +21,17 @@ jobs:
         run: |
           set -euo pipefail
           release_tag="${TRIGGER_TAG#publish-draft-}"
+          release_tag="${release_tag%-retry.*}"
           if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
             echo "::error title=Invalid release tag::Unexpected tag: $release_tag"
             exit 1
           fi
           version="${release_tag#v}"
-          release_json=$(gh api "repos/$REPOSITORY/releases/tags/$release_tag") || {
-            echo "::error title=Draft release lookup failed::No release found for $release_tag"
+          echo "Looking up release $release_tag in $REPOSITORY."
+          if ! release_json=$(gh api "repos/$REPOSITORY/releases/tags/$release_tag" 2>&1); then
+            echo "::error title=Draft release lookup failed::GitHub API response: ${release_json//$'\n'/ }"
             exit 1
-          }
+          fi
           release_id=$(jq -r '.id' <<<"$release_json")
           is_draft=$(jq -r '.draft' <<<"$release_json")
           if [[ "$is_draft" != true ]]; then
@@ -52,10 +54,10 @@ jobs:
             fi
           done
           echo "Validated ${#required[@]} non-empty release assets for $release_tag."
-          published=$(gh api --method PATCH "repos/$REPOSITORY/releases/$release_id" -f draft=false -F prerelease=true) || {
-            echo "::error title=Release publication failed::GitHub could not publish release $release_tag"
+          if ! published=$(gh api --method PATCH "repos/$REPOSITORY/releases/$release_id" -f draft=false -F prerelease=true 2>&1); then
+            echo "::error title=Release publication failed::GitHub API response: ${published//$'\n'/ }"
             exit 1
-          }
+          fi
           if [[ $(jq -r '.draft' <<<"$published") != false ]]; then
             echo "::error title=Release publication unconfirmed::GitHub still reports $release_tag as a draft"
             exit 1
@@ -63,8 +65,15 @@ jobs:
           echo "Published $release_tag: https://github.com/$REPOSITORY/releases/tag/$release_tag"
 
           asset_id=$(jq -r '.assets[] | select(.name == "latest.json") | .id' <<<"$published")
+          if [[ -z "$asset_id" || "$asset_id" == null ]]; then
+            echo "::error title=Manifest asset missing::Published release response did not include latest.json asset ID"
+            exit 1
+          fi
           manifest=$(mktemp)
-          gh api "repos/$REPOSITORY/releases/assets/$asset_id" -H 'Accept: application/octet-stream' > "$manifest"
+          if ! gh api "repos/$REPOSITORY/releases/assets/$asset_id" -H 'Accept: application/octet-stream' > "$manifest"; then
+            echo "::error title=Manifest download failed::Could not download signed latest.json from release $release_tag"
+            exit 1
+          fi
           if ! jq -e --arg version "$version" '.version == $version and .platforms["windows-x86_64"].url and .platforms["windows-x86_64"].signature' "$manifest" >/dev/null; then
             echo "::error title=Updater manifest invalid::Published latest.json is not a signed Windows manifest for $version"
             exit 1
