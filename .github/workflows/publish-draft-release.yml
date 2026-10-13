@@ -28,8 +28,14 @@ jobs:
           fi
           version="${release_tag#v}"
           echo "Looking up release $release_tag in $REPOSITORY."
-          if ! release_json=$(gh api "repos/$REPOSITORY/releases/tags/$release_tag" 2>&1); then
-            echo "::error title=Draft release lookup failed::GitHub API response: ${release_json//$'\n'/ }"
+          if ! releases=$(gh api "repos/$REPOSITORY/releases?per_page=100" 2>&1); then
+            echo "::error title=Release listing failed::GitHub API response: ${releases//$'\n'/ }"
+            exit 1
+          fi
+          release_json=$(jq -c --arg tag "$release_tag" '[.[] | select(.tag_name == $tag and .draft == true)][0] // empty' <<<"$releases")
+          if [[ -z "$release_json" ]]; then
+            visible=$(jq -r '[.[] | .tag_name] | join(", ")' <<<"$releases")
+            echo "::error title=Draft release lookup failed::No draft found for $release_tag. Visible releases: $visible"
             exit 1
           fi
           release_id=$(jq -r '.id' <<<"$release_json")
