@@ -1,3 +1,4 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::fs;
@@ -310,6 +311,288 @@ fn browse_directory() -> Result<Option<String>, String> {
         Ok(rfd::FileDialog::new()
             .pick_folder()
             .map(|path| path.to_string_lossy().into_owned()))
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMedia {
+    name: String,
+    path: String,
+    kind: String,
+    size: u64,
+}
+
+fn media_kind(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "avif" | "svg" => Some("image"),
+        "mp4" | "webm" | "mov" | "m4v" | "mkv" => Some("video"),
+        "mp3" | "wav" | "ogg" | "m4a" | "flac" => Some("audio"),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+fn import_workspace_media(
+    workspace: State<'_, WorkspaceState>,
+) -> Result<Option<WorkspaceMedia>, String> {
+    #[cfg(target_os = "android")]
+    return Err("Импорт медиа в проект доступен в desktop-версии".into());
+    #[cfg(not(target_os = "android"))]
+    {
+        let Some(source) = rfd::FileDialog::new()
+            .add_filter(
+                "Медиафайлы",
+                &[
+                    "png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "svg", "mp4", "webm",
+                    "mov", "m4v", "mkv", "mp3", "wav", "ogg", "m4a", "flac",
+                ],
+            )
+            .pick_file()
+        else {
+            return Ok(None);
+        };
+        let kind = media_kind(&source)
+            .ok_or_else(|| "Формат этого медиафайла не поддерживается".to_owned())?;
+        let root = workspace.active_root()?;
+        let directory = root.join("media");
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("Не удалось создать папку media: {error}"))?;
+        let original_name = source
+            .file_name()
+            .ok_or_else(|| "Не удалось определить имя медиафайла".to_owned())?;
+        let mut target = directory.join(original_name);
+        if target.exists() {
+            let stem = source
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("media");
+            let extension = source
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let mut index = 2;
+            loop {
+                let name = if extension.is_empty() {
+                    format!("{stem} ({index})")
+                } else {
+                    format!("{stem} ({index}).{extension}")
+                };
+                target = directory.join(name);
+                if !target.exists() {
+                    break;
+                }
+                index += 1;
+            }
+        }
+        fs::copy(&source, &target)
+            .map_err(|error| format!("Не удалось добавить файл в проект: {error}"))?;
+        let metadata = fs::metadata(&target).map_err(|error| error.to_string())?;
+        Ok(Some(WorkspaceMedia {
+            name: target
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            path: target.to_string_lossy().into_owned(),
+            kind: kind.to_owned(),
+            size: metadata.len(),
+        }))
+    }
+}
+
+#[tauri::command]
+fn list_workspace_media(
+    workspace: State<'_, WorkspaceState>,
+) -> Result<Vec<WorkspaceMedia>, String> {
+    let root = workspace.active_root()?;
+    let directory = root.join("media");
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut items = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if let (Some(kind), Ok(metadata)) = (media_kind(&path), entry.metadata()) {
+            if metadata.is_file() {
+                items.push(WorkspaceMedia {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    path: path.to_string_lossy().into_owned(),
+                    kind: kind.to_owned(),
+                    size: metadata.len(),
+                });
+            }
+        }
+    }
+    items.sort_by_key(|item| item.name.to_lowercase());
+    Ok(items)
+}
+
+#[tauri::command]
+fn read_workspace_media_preview(
+    workspace: State<'_, WorkspaceState>,
+    path: String,
+) -> Result<String, String> {
+    let root = workspace.active_root()?;
+    let path = checked_workspace_path(&root, &path)?;
+    let kind = media_kind(&path)
+        .ok_or_else(|| "Тип медиафайла не поддерживает предпросмотр".to_owned())?;
+    let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+    let limit = if kind == "image" {
+        32 * 1024 * 1024
+    } else {
+        64 * 1024 * 1024
+    };
+    if metadata.len() > limit {
+        return Err(format!("Файл слишком большой для встроенного предпросмотра (лимит {} МБ); его можно экспортировать из проекта", limit / 1024 / 1024));
+    }
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("svg"))
+    {
+        let markup = String::from_utf8(bytes.clone())
+            .map_err(|_| "SVG-файл должен быть в UTF-8".to_owned())?
+            .to_ascii_lowercase();
+        if [
+            "<script",
+            "<foreignobject",
+            "onload=",
+            "onerror=",
+            "javascript:",
+            "href=\"http",
+            "href='http",
+            "href=\"//",
+            "href='//",
+            "url(http",
+        ]
+        .iter()
+        .any(|needle| markup.contains(needle))
+        {
+            return Err(
+                "SVG содержит активный код или внешние ресурсы и не будет открыт в предпросмотре"
+                    .into(),
+            );
+        }
+    }
+    let mime = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        _ => return Err("Неизвестный формат медиафайла".into()),
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+#[tauri::command]
+fn save_workspace_media_output(
+    workspace: State<'_, WorkspaceState>,
+    file_name: String,
+    data_base64: String,
+) -> Result<WorkspaceMedia, String> {
+    let name = Path::new(&file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| *value == file_name && !value.is_empty() && value.len() <= 120)
+        .ok_or_else(|| "Недопустимое имя выходного медиафайла".to_owned())?;
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "webm") {
+        return Err("Редактор сохраняет изображения как PNG, а видео как WebM".into());
+    }
+    if data_base64.len() > 96 * 1024 * 1024 {
+        return Err("Выходной медиафайл превышает лимит 72 МБ".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|_| "Редактор вернул некорректные данные".to_owned())?;
+    let signature_matches = match extension.as_str() {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "webm" => bytes.starts_with(b"\x1aE\xdf\xa3"),
+        _ => false,
+    };
+    if !signature_matches {
+        return Err("Содержимое файла не соответствует его формату".into());
+    }
+    let root = workspace.active_root()?;
+    let directory = root.join("media");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("edited-media");
+    let mut target = directory.join(name);
+    let mut index = 2;
+    while target.exists() {
+        target = directory.join(format!("{stem}-{index}.{extension}"));
+        index += 1;
+    }
+    fs::write(&target, &bytes)
+        .map_err(|error| format!("Не удалось сохранить результат: {error}"))?;
+    Ok(WorkspaceMedia {
+        name: target
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        path: target.to_string_lossy().into_owned(),
+        kind: if extension == "png" { "image" } else { "video" }.to_owned(),
+        size: bytes.len() as u64,
+    })
+}
+
+#[tauri::command]
+fn export_workspace_media(
+    workspace: State<'_, WorkspaceState>,
+    path: String,
+) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    return Err("Экспорт медиа доступен в desktop-версии".into());
+    #[cfg(not(target_os = "android"))]
+    {
+        let root = workspace.active_root()?;
+        let source = checked_workspace_path(&root, &path)?;
+        if media_kind(&source).is_none() || !source.is_file() {
+            return Err("Выберите медиафайл внутри открытого проекта".into());
+        }
+        let file_name = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let Some(destination) = rfd::FileDialog::new().set_file_name(file_name).save_file() else {
+            return Ok(None);
+        };
+        fs::copy(source, &destination)
+            .map_err(|error| format!("Не удалось сохранить медиафайл: {error}"))?;
+        Ok(Some(destination.to_string_lossy().into_owned()))
     }
 }
 
@@ -1465,6 +1748,11 @@ pub fn run() {
         .manage(openhands::DirectModelState::default())
         .invoke_handler(tauri::generate_handler![
             list_directory,
+            import_workspace_media,
+            list_workspace_media,
+            read_workspace_media_preview,
+            save_workspace_media_output,
+            export_workspace_media,
             browse_directory,
             browse_project_parent,
             create_project_directory,
