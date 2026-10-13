@@ -6,7 +6,7 @@ Flux Hands объединяет редактор проекта, проводн�
 
 ![Рабочее пространство Flux Hands с проектом и окном AI-агента](docs/images/flux-hands-workspace.png)
 
-> **Текущая версия:** [1.0.16-beta.2](https://github.com/Heepean/Flux-code/releases/tag/v1.0.16-beta.2). Это тестовая prerelease-версия; ниже перечислены ограничения, которые ещё требуют проверки на чистой системе и реальных устройствах.
+> **Текущая версия:** [1.0.16-beta.2](https://github.com/Heepean/Flux-code/releases/tag/v1.0.17-beta.1). Это тестовая prerelease-версия; ниже перечислены ограничения, которые ещё требуют проверки на чистой системе и реальных устройствах.
 
 ## Изменения в исходниках после beta.2 (ещё не опубликованы)
 
@@ -16,10 +16,10 @@ Flux Hands объединяет редактор проекта, проводн�
 
 ## Скачать
 
-- [Windows x64 — установщик](https://github.com/Heepean/Flux-code/releases/download/v1.0.16-beta.2/Flux.Hands_1.0.16_x64-setup.exe)
-- [Windows x64 — MSI](https://github.com/Heepean/Flux-code/releases/download/v1.0.16-beta.2/Flux.Hands_1.0.16_x64_en-US.msi)
-- [Android ARM64 — APK для Android 15+](https://github.com/Heepean/Flux-code/releases/download/v1.0.16-beta.2/Flux.Hands_v1.0.16-beta.2_android-arm64-debug.apk)
-- [Все файлы и журнал изменений](https://github.com/Heepean/Flux-code/releases/tag/v1.0.16-beta.2)
+- [Windows x64 — установщик](https://github.com/Heepean/Flux-code/releases/download/v1.0.17-beta.1/Flux.Hands_1.0.17_x64-setup.exe)
+- [Windows x64 — MSI](https://github.com/Heepean/Flux-code/releases/download/v1.0.17-beta.1/Flux.Hands_1.0.17_x64_en-US.msi)
+- [Android ARM64 — APK для Android 15+](https://github.com/Heepean/Flux-code/releases/download/v1.0.17-beta.1/Flux.Hands_v1.0.17-beta.1_android-arm64-debug.apk)
+- [Все файлы и журнал изменений](https://github.com/Heepean/Flux-code/releases/tag/v1.0.17-beta.1)
 
 ## Возможности
 
