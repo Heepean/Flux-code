@@ -16,7 +16,7 @@ Build a dependable Windows desktop workspace for projects, local GGUF models, an
 
 ## Current verified baseline (2026-10-13)
 
-- On 2026-10-12, the production frontend build, Rust formatting check, strict Clippy check, and all 33 Rust unit tests passed on the current local source.
+- On 2026-10-13, `npm run build`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and all 33 Rust tests passed. The Android ARM64 Rust target check also passed with NDK 27.2.12479018.
 - Both supplied user GGUFs completed local inference on CPU and GPU using disposable llama-server builds. Nemotron Q6_K reached about 57 tokens/s on the RX 7700 XT Vulkan backend; Ternary Bonsai PQ2_0 reached about 40 tokens/s with PrismML. The 27B model works on CPU too but leaves about 0.34 GB free RAM and runs at about 4 tokens/s, so Vulkan GPU is the practical mode on this PC.
 - Added a persisted CPU/Vulkan choice and format-aware runtime bootstrap. The desktop runtime installer itself still needs a clean native Tauri invocation test before calling the feature verified end-to-end.
 - A regression test now proves a running llama.cpp process is stopped before the next model's RAM preflight, preventing the previous model's resident memory from causing a false refusal. Direct full-size model inference was verified, while the app-mediated model switching flow is still pending native UI validation.
@@ -26,7 +26,7 @@ Build a dependable Windows desktop workspace for projects, local GGUF models, an
 - A direct pinned OpenHands 1.26.0 request using the app's `openai/kilo-auto/free` model ID returned the expected Kilo response and finished; the full native UI flow still needs a desktop-window smoke test.
 - Project creation and per-project chats/transcripts are implemented; browser preview showed the open-existing/create-new dialog and new-chat entry. The selected chat ID is now persisted separately per workspace so restart restoration can reopen the user's last chat; native folder dialogs, project switching and chat reload/continuation still need UI runtime verification.
 - The editor now has explicit Save/Ctrl+S and dirty indicators; only the production frontend build has been verified for this change. Native editing, failed save and external-change scenarios remain pending.
-- GitHub publishes `v1.0.15-beta.1` as a prerelease with Windows setup/MSI/updater files and an ARM64 debug APK (171 MB); `v1.0.8` remains the latest stable release. Hosted run `38231141807` passed its five-asset publication gate. The job then failed in old-release cleanup because it lacked a checkout; the workflow fix is committed on `main` for subsequent release runs, and stale-release cleanup remains outstanding. APK signature and public download are verified, but installation/runtime on Android remains unverified because no device or emulator is attached. See the current evidence in [the audit](PROJECT_AUDIT.md) and [implementation status](IMPLEMENTATION_STATUS.md).
+- GitHub publishes `v1.0.16-beta.2` with a signed Windows setup/MSI/updater set and Android ARM64 debug APK; `v1.0.8` remains latest stable. The hosted release gate passed and all five expected assets return HTTP 200. Windows clean install/upgrade and Android installation/runtime remain unverified. See [the current release](https://github.com/Heepean/Flux-code/releases/tag/v1.0.16-beta.2) and [implementation status](IMPLEMENTATION_STATUS.md).
 
 See [PROJECT_AUDIT.md](PROJECT_AUDIT.md) for evidence and limitations, and [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for release gates.
 
@@ -42,7 +42,7 @@ Keep an evidence-backed feature matrix, architecture notes, reproducible build i
 
 - Verify first launch, folder selection, file listing/open/edit/save, errors, and restart persistence on Windows.
 - Fix critical local model and OpenHands integration defects; test startup, model switch, request, failure, cancellation, and shutdown.
-- Verify Android remote connection and a task on Android 15+ hardware or emulator.
+- Verify direct remote model chat on Android 15+ hardware or emulator; Android does not use Agent Server.
 - Improve process cleanup, dependency/runtime setup feedback, and diagnostic messages.
 - Validate installers and updater without losing workspace or user settings.
 
@@ -124,8 +124,8 @@ Continue with Tauri, Rust, and React/TypeScript while that keeps boundaries test
 3. Complete desktop file/editor and model-switch scenarios in a built/installed app.
 4. Complete Android 15+ install and remote task scenarios.
 5. Implement diff/undo and task cancellation after their source/runtime contracts are established.
-6. Repair CI Android release workflow, publish a verifiable candidate, and perform clean install/upgrade checks.
+6. CI release publication is verified for v1.0.16-beta.2; perform clean Windows install/upgrade checks and Android 15+ installation plus remote-chat smoke test.
 7. Continue through user feedback and only then evaluate P2 expansion.
 
 
-- v1.0.16 routes Kilo and OpenAI-compatible remote chat directly to the provider on desktop and Android; OpenHands Agent Server remains attached to desktop local-model tasks. The uv archive extractor locates assets by ZIP index and verifies upstream digests. Frontend build and all 33 Rust tests pass; Android SDK/NDK are not installed locally, and Android device runtime is not yet verified.
+- v1.0.16 routes Kilo and OpenAI-compatible remote chat directly to the provider on desktop and Android; OpenHands Agent Server remains attached to desktop local-model tasks. The uv archive extractor locates assets by ZIP index and verifies upstream digests. Frontend build and all 33 Rust tests pass. Android cross-check and ARM64 APK assembly passed locally after copying the compiled library around the Windows symlink restriction; the published APK also passed CI signature verification. No Android device is attached, so installation/runtime remain unverified.
