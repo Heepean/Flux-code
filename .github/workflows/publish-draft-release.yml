@@ -1,0 +1,72 @@
+name: Publish verified Flux Hands draft
+
+on:
+  push:
+    tags:
+      - 'publish-draft-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the already-built beta release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TRIGGER_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${TRIGGER_TAG#publish-draft-}"
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+            echo "::error title=Invalid release tag::Unexpected tag: $release_tag"
+            exit 1
+          fi
+          version="${release_tag#v}"
+          release_json=$(gh api "repos/$REPOSITORY/releases/tags/$release_tag") || {
+            echo "::error title=Draft release lookup failed::No release found for $release_tag"
+            exit 1
+          }
+          release_id=$(jq -r '.id' <<<"$release_json")
+          is_draft=$(jq -r '.draft' <<<"$release_json")
+          if [[ "$is_draft" != true ]]; then
+            echo "::error title=Release is not a draft::$release_tag is already published"
+            exit 1
+          fi
+          required=(
+            "Flux.Hands_${version}_x64-setup.exe"
+            "Flux.Hands_${version}_x64-setup.exe.sig"
+            "latest.json"
+            "Flux Hands_${version}_x64_en-US.msi"
+            "Flux.Hands_${release_tag}_android-arm64-debug.apk"
+          )
+          names=$(jq -r '.assets[].name' <<<"$release_json")
+          for asset in "${required[@]}"; do
+            count=$(jq --arg name "$asset" '[.assets[] | select(.name == $name and .size > 0)] | length' <<<"$release_json")
+            if [[ "$count" != 1 ]]; then
+              echo "::error title=Release asset validation failed::$asset missing, empty, or duplicated. Found assets: ${names//$'\n'/, }"
+              exit 1
+            fi
+          done
+          echo "Validated ${#required[@]} non-empty release assets for $release_tag."
+          published=$(gh api --method PATCH "repos/$REPOSITORY/releases/$release_id" -f draft=false -F prerelease=true) || {
+            echo "::error title=Release publication failed::GitHub could not publish release $release_tag"
+            exit 1
+          }
+          if [[ $(jq -r '.draft' <<<"$published") != false ]]; then
+            echo "::error title=Release publication unconfirmed::GitHub still reports $release_tag as a draft"
+            exit 1
+          fi
+          echo "Published $release_tag: https://github.com/$REPOSITORY/releases/tag/$release_tag"
+
+          asset_id=$(jq -r '.assets[] | select(.name == "latest.json") | .id' <<<"$published")
+          manifest=$(mktemp)
+          gh api "repos/$REPOSITORY/releases/assets/$asset_id" -H 'Accept: application/octet-stream' > "$manifest"
+          if ! jq -e --arg version "$version" '.version == $version and .platforms["windows-x86_64"].url and .platforms["windows-x86_64"].signature' "$manifest" >/dev/null; then
+            echo "::error title=Updater manifest invalid::Published latest.json is not a signed Windows manifest for $version"
+            exit 1
+          fi
+          echo "Verified signed Windows updater manifest for $version."
