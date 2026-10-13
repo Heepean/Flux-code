@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "flux-hands"
-version = "1.0.18-beta.2"
+version = "1.0.18-beta.3"
 dependencies = [
  "base64 0.22.1",
  "futures-util",

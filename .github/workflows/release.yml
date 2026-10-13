@@ -60,7 +60,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Run Rust tests
         working-directory: src-tauri
-        run: cargo test -- --test-threads=1
+        run: cargo test -- --test-threads=1 --nocapture
       - name: Verify updater signing secrets
         shell: pwsh
         env:
@@ -70,11 +70,30 @@ jobs:
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
             throw 'Set TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD in repository Actions secrets.'
           }
-      - name: Build signed Windows installers
-        run: npm run build:desktop
+      - name: Build signed Windows NSIS installer
+        run: npm run tauri -- build --bundles nsis --ci
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Build Windows MSI with a WiX-compatible beta version
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ($config.version -match '^(?<base>\d+\.\d+\.\d+)-beta\.(?<number>\d+)$') {
+            $msiVersion = "$($Matches.base)-$($Matches.number)"
+          } elseif ($config.version -match '^\d+\.\d+\.\d+$') {
+            $msiVersion = [string]$config.version
+          } else {
+            throw "Cannot map app version '$($config.version)' to a WiX-compatible MSI version."
+          }
+          $override = @{ version = $msiVersion } | ConvertTo-Json -Compress
+          $overridePath = Join-Path $env:RUNNER_TEMP 'tauri-msi-version.json'
+          [System.IO.File]::WriteAllText($overridePath, $override, [System.Text.UTF8Encoding]::new($false))
+          npm run tauri -- build --bundles msi --ci --no-sign --ignore-version-mismatches --config $overridePath
       - name: Prepare signed updater manifest
         id: assets
         shell: pwsh
@@ -89,7 +108,8 @@ jobs:
           if (-not $source) { throw 'NSIS installer was not generated.' }
           $sourceSig = "$($source.FullName).sig"
           if (-not (Test-Path $sourceSig)) { throw 'Tauri updater signature is missing.' }
-          $msi = Get-ChildItem 'src-tauri/target/release/bundle/msi' -Filter '*.msi' | Select-Object -First 1
+          $msiVersion = if ($version -match '^(\d+\.\d+\.\d+)-beta\.(\d+)$') { "$($Matches[1])-$($Matches[2])" } else { $version }
+          $msi = Get-ChildItem 'src-tauri/target/release/bundle/msi' -Filter "Flux Hands_${msiVersion}_x64_en-US.msi" | Select-Object -First 1
           if (-not $msi) { throw 'MSI installer was not generated.' }
           $staging = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
@@ -98,7 +118,8 @@ jobs:
           $signature = "$installer.sig"
           Copy-Item $source.FullName $installer
           Copy-Item $sourceSig $signature
-          Copy-Item $msi.FullName (Join-Path $staging $msi.Name)
+          $releaseMsiName = "Flux Hands_${version}_x64_en-US.msi"
+          Copy-Item $msi.FullName (Join-Path $staging $releaseMsiName)
           $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG"
           $manifest = @{
             version = $version
@@ -113,7 +134,7 @@ jobs:
           } | ConvertTo-Json -Depth 6
           $manifestPath = Join-Path $staging 'latest.json'
           [System.IO.File]::WriteAllText($manifestPath, $manifest, [System.Text.UTF8Encoding]::new($false))
-          $expected = @($assetName, "$assetName.sig", 'latest.json', $msi.Name)
+          $expected = @($assetName, "$assetName.sig", 'latest.json', $releaseMsiName)
           foreach ($name in $expected) {
             $assetPath = Join-Path $staging $name
             if (-not (Test-Path $assetPath) -or (Get-Item $assetPath).Length -le 0) { throw "Release asset is missing or empty: $name" }
@@ -221,13 +242,13 @@ jobs:
             'latest.json',
             "Flux.Hands_$($env:RELEASE_TAG)_android-arm64-debug.apk"
           )
-          $msiPattern = '^Flux[ .]Hands_' + [regex]::Escape($version) + '_x64_en-US\.msi$'
+          $msiName = "Flux Hands_${version}_x64_en-US.msi"
           $windowsAssets = @($env:WINDOWS_ASSETS | ConvertFrom-Json)
           $androidAssets = @($env:ANDROID_ASSETS | ConvertFrom-Json)
           $assets = @($windowsAssets) + @($androidAssets)
           $names = @($assets | ForEach-Object { $_.name })
           $missing = @($expected | Where-Object { $_ -notin $names })
-          $msiAssets = @($assets | Where-Object { $_.name -match $msiPattern })
+          $msiAssets = @($assets | Where-Object { $_.name -eq $msiName })
           if ($missing.Count -gt 0 -or $msiAssets.Count -ne 1) {
             throw "Uploaded asset outputs did not pass verification. Missing: $($missing -join ', '); matching MSI count: $($msiAssets.Count). Returned names: $($names -join ', ')."
           }
@@ -241,7 +262,7 @@ jobs:
           $publishedAssets = @($published.assets)
           $publishedNames = @($publishedAssets | ForEach-Object { $_.name })
           $stillMissing = @($expected | Where-Object { $_ -notin $publishedNames })
-          $publishedMsi = @($publishedAssets | Where-Object { $_.name -match $msiPattern })
+          $publishedMsi = @($publishedAssets | Where-Object { $_.name -eq $msiName })
           if ($stillMissing.Count -gt 0 -or $publishedMsi.Count -ne 1) { throw "Published release response is missing assets: $($stillMissing -join ', '); matching MSI count: $($publishedMsi.Count)." }
           foreach ($asset in @($publishedAssets | Where-Object { $_.name -in $expected }) + $publishedMsi) {
             if ($asset.size -le 0) { throw "Published release contains an empty asset: $($asset.name)" }

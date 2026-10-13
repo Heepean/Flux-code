@@ -1941,8 +1941,9 @@ mod workspace_search_tests {
     #[cfg(windows)]
     #[test]
     fn detected_machine_selects_a_real_prism_backend() {
-        let selected = llama_runtime_backend("vulkan", true, has_amd_radeon_adapter()).unwrap();
-        assert_eq!(selected, "hip");
+        let has_radeon = has_amd_radeon_adapter();
+        let selected = llama_runtime_backend("vulkan", true, has_radeon).unwrap();
+        assert_eq!(selected, if has_radeon { "hip" } else { "vulkan" });
     }
 
     #[cfg(windows)]
