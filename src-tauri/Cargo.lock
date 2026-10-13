@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "flux-hands"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "futures-util",
  "keyring",

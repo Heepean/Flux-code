@@ -11,6 +11,7 @@ use crate::{terminate_process_tree, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 const SERVER_VERSION: &str = "1.26.0";
@@ -22,6 +23,8 @@ const UV_WINDOWS_ARCHIVE: &str = "uv-x86_64-pc-windows-msvc.zip";
 #[derive(Default)]
 pub struct DirectModelState {
     generation: Arc<AtomicU64>,
+    approvals:
+        tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
 }
 type AgentConfig = (String, String, String, String, String);
 
@@ -604,6 +607,649 @@ pub async fn send_direct_model_message(
     .await
 }
 
+#[derive(Serialize, Clone)]
+struct DirectAgentEvent {
+    delta: String,
+    done: bool,
+    conversation_id: Option<String>,
+    error: Option<String>,
+    status: Option<String>,
+    pending_approvals: Option<Vec<PendingApproval>>,
+    file_changes: Option<Vec<AgentFileChange>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectAgentRequest {
+    provider: String,
+    model: String,
+    endpoint: String,
+    api_key: Option<String>,
+    messages: Vec<DirectChatMessage>,
+    allow_project_access: bool,
+}
+
+fn direct_agent_tools() -> serde_json::Value {
+    serde_json::json!([
+        {"type":"function","function":{"name":"list_files","description":"List files and directories inside the opened project.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Project-relative directory; empty means project root"}},"required":["path"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"read_file","description":"Read a UTF-8 text file from the opened project.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"search_project","description":"Search text in files in the opened project.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"write_file","description":"Create a new UTF-8 text file or replace an existing project file. Requires user approval.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"run_command","description":"Run a terminal command in the opened project. Requires user approval.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}
+    ])
+}
+
+#[tauri::command]
+pub async fn send_direct_model_agent(
+    state: State<'_, DirectModelState>,
+    workspace: State<'_, WorkspaceState>,
+    app: AppHandle,
+    request: DirectAgentRequest,
+) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (&state, &workspace, &app, &request);
+        return Err("Инструменты проекта доступны только в desktop-версии".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        if !request.allow_project_access {
+            return Err("Сначала разрешите передачу файлов проекта удалённой модели".into());
+        }
+        let _workspace_guard = workspace.begin_agent_task()?;
+        let root = workspace.active_root()?;
+        let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+        let provider = request.provider.trim().to_ascii_lowercase();
+        let model = request.model.trim();
+        if !matches!(provider.as_str(), "remote" | "kilo") || model.is_empty() {
+            return Err("Выберите удалённую модель перед отправкой".into());
+        }
+        if request.messages.is_empty() || request.messages.len() > 40 {
+            return Err("В чате должно быть от 1 до 40 сообщений".into());
+        }
+        let mut total_chars = 0usize;
+        let mut request_messages = Vec::with_capacity(request.messages.len());
+        for message in request.messages {
+            if !matches!(message.role.as_str(), "user" | "assistant") {
+                return Err("История чата содержит неизвестную роль сообщения".into());
+            }
+            total_chars = total_chars.saturating_add(message.content.chars().count());
+            if total_chars > 64_000 {
+                return Err("История чата превышает лимит 64000 символов".into());
+            }
+            request_messages
+                .push(serde_json::json!({"role":message.role,"content":message.content}));
+        }
+        let (base, api_key) = if provider == "kilo" {
+            (KILO_GATEWAY_BASE.to_string(), String::new())
+        } else {
+            let base = normalize_endpoint(&request.endpoint)?;
+            #[cfg(target_os = "android")]
+            let api_key = request.api_key.unwrap_or_default().trim().to_owned();
+            #[cfg(not(target_os = "android"))]
+            let api_key = request
+                .api_key
+                .filter(|key| !key.trim().is_empty())
+                .or_else(|| {
+                    remote_key_entry()
+                        .ok()
+                        .and_then(|entry| entry.get_password().ok())
+                })
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if api_key.is_empty()
+                && !reqwest::Url::parse(&base)
+                    .ok()
+                    .and_then(|url| {
+                        url.host_str()
+                            .map(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"))
+                    })
+                    .unwrap_or(false)
+            {
+                return Err("Введите API-ключ этой модели в настройках".into());
+            }
+            (base, api_key)
+        };
+        let emitter = DirectAgentEventEmitter(move |event| {
+            app.emit("direct-agent-event", event)
+                .map_err(|error| error.to_string())
+        });
+        run_direct_agent_loop(
+            &state,
+            root,
+            base,
+            model.to_owned(),
+            api_key,
+            request_messages,
+            emitter,
+        )
+        .await
+    }
+}
+
+struct DirectAgentEventEmitter<F>(F);
+
+impl<F> DirectAgentEventEmitter<F>
+where
+    F: Fn(DirectAgentEvent) -> Result<(), String>,
+{
+    fn emit(&self, event: DirectAgentEvent) -> Result<(), String> {
+        (self.0)(event)
+    }
+}
+
+async fn run_direct_agent_loop<F>(
+    state: &DirectModelState,
+    root: PathBuf,
+    base: String,
+    model: String,
+    api_key: String,
+    mut request_messages: Vec<serde_json::Value>,
+    emitter: DirectAgentEventEmitter<F>,
+) -> Result<String, String>
+where
+    F: Fn(DirectAgentEvent) -> Result<(), String> + Send + Sync,
+{
+    let generation_state = Arc::clone(&state.generation);
+    let generation = generation_state.fetch_add(1, Ordering::SeqCst) + 1;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut file_changes = Vec::new();
+    let mut tool_call_count = 0usize;
+    for _ in 0..16 {
+        let value = request_direct_agent_completion(
+            &client,
+            &base,
+            &model,
+            &request_messages,
+            &api_key,
+            &generation_state,
+            generation,
+        )
+        .await?;
+        let message = value
+            .pointer("/choices/0/message")
+            .cloned()
+            .ok_or("Модель вернула пустой ответ")?;
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if tool_calls.is_empty() {
+            let answer = completion_text(&value)?;
+            let _ = emitter.emit(DirectAgentEvent {
+                delta: String::new(),
+                done: true,
+                conversation_id: None,
+                error: None,
+                status: Some("Удалённая агентская задача завершена".into()),
+                pending_approvals: None,
+                file_changes: Some(file_changes),
+            });
+            return Ok(answer);
+        }
+        if tool_call_count.saturating_add(tool_calls.len()) > 16 {
+            return Err(
+                "Удалённая модель запросила больше 16 действий инструментов за одну задачу".into(),
+            );
+        }
+        request_messages.push(message);
+        for call in tool_calls {
+            tool_call_count += 1;
+            if generation_state.load(Ordering::SeqCst) != generation {
+                return Err("Запрос удалённой модели остановлен".into());
+            }
+            let id = call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Вызов инструмента не содержит ID")?
+                .to_owned();
+            let function = call
+                .get("function")
+                .ok_or("Вызов инструмента не содержит функции")?;
+            let name = function
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Вызов инструмента не содержит имени")?;
+            let args_text = function
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("{}");
+            if args_text.len() > 2_000_000 {
+                return Err("Аргументы инструмента превышают 2 MB".into());
+            }
+            let args: serde_json::Value = serde_json::from_str(args_text)
+                .map_err(|error| format!("Некорректные аргументы инструмента: {error}"))?;
+            let result = match name {
+                "list_files" => direct_agent_list_files(
+                    &root,
+                    args.get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                ),
+                "read_file" => direct_agent_read_file(
+                    &root,
+                    args.get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                ),
+                "search_project" => direct_agent_search(
+                    &root,
+                    args.get("query")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                ),
+                "write_file" | "run_command" => {
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    let approval_id = Uuid::new_v4().to_string();
+                    state
+                        .approvals
+                        .lock()
+                        .await
+                        .insert(approval_id.clone(), sender);
+                    if let Err(error) = emitter.emit(DirectAgentEvent { delta: String::new(), done: false, conversation_id: None, error: None, status: Some("Ожидает подтверждения действия удалённого агента".into()), pending_approvals: Some(vec![PendingApproval { tool_name: name.to_owned(), security_risk: if name == "run_command" { "HIGH".into() } else { "MODERATE".into() }, action: serde_json::json!({"approval_id":approval_id,"tool":name,"arguments":args}) }]), file_changes: None }) {
+                    state.approvals.lock().await.remove(&approval_id);
+                    return Err(error.to_string());
+                }
+                    let approved = tokio::select! {
+                        result = receiver => result.unwrap_or(false),
+                        _ = wait_for_direct_request_cancel(&generation_state, generation) => { state.approvals.lock().await.remove(&approval_id); return Err("Запрос удалённой модели остановлен".into()); }
+                    };
+                    if !approved {
+                        Ok("Действие отклонено пользователем".into())
+                    } else if name == "write_file" {
+                        direct_agent_write_file(&root, &args, &mut file_changes)
+                    } else {
+                        direct_agent_run_command(
+                            &root,
+                            args.get("command")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or(""),
+                        )
+                        .await
+                    }
+                }
+                _ => Err(format!("Неизвестный инструмент: {name}")),
+            };
+            let mut output = result.unwrap_or_else(|error| format!("Ошибка инструмента: {error}"));
+            if output.len() > 64 * 1024 {
+                truncate_utf8(&mut output, 64 * 1024);
+                output.push_str("\n[вывод сокращён до 64 KB]");
+            }
+            request_messages
+                .push(serde_json::json!({"role":"tool","tool_call_id":id,"content":output}));
+            let _ = emitter.emit(DirectAgentEvent {
+                delta: String::new(),
+                done: false,
+                conversation_id: None,
+                error: None,
+                status: Some("Удалённый агент работает с проектом".into()),
+                pending_approvals: None,
+                file_changes: Some(file_changes.clone()),
+            });
+        }
+    }
+    Err("Удалённый агент превысил лимит 16 циклов инструментов".into())
+}
+
+async fn request_direct_agent_completion(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    api_key: &str,
+    generation_state: &AtomicU64,
+    generation: u64,
+) -> Result<serde_json::Value, String> {
+    if serde_json::to_vec(messages)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 2 * 1024 * 1024
+    {
+        return Err("Контекст удалённого агента превысил лимит 2 MB".into());
+    }
+    let mut request = client
+        .post(format!("{base}/chat/completions"))
+        .json(&serde_json::json!({"model":model,"messages":messages,"tools":direct_agent_tools(),"tool_choice":"auto","stream":false}));
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let mut response = tokio::select! {
+        result = request.send() => result.map_err(|error| format!("Не удалось подключиться к модели: {error}"))?,
+        _ = wait_for_direct_request_cancel(generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
+    };
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|length| length > 4 * 1024 * 1024)
+    {
+        return Err("Ответ удалённого провайдера превышает предел 4 MB".into());
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            result = response.chunk() => result.map_err(|error| error.to_string())?,
+            _ = wait_for_direct_request_cancel(generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
+        };
+        let Some(chunk) = chunk else { break };
+        if body.len().saturating_add(chunk.len()) > 4 * 1024 * 1024 {
+            return Err("Ответ удалённого провайдера превышает предел 4 MB".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "Провайдер вернул HTTP {status}: {}",
+            String::from_utf8_lossy(&body)
+        ));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("Провайдер вернул некорректный JSON: {error}"))
+}
+
+fn direct_agent_target(root: &Path, relative: &str, must_exist: bool) -> Result<PathBuf, String> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() {
+        return Err(
+            "Инструменты удалённого агента принимают только относительные пути проекта".into(),
+        );
+    }
+    let joined = root.join(candidate);
+    let canonical = match std::fs::symlink_metadata(&joined) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(
+                    "Инструменты удалённого агента не открывают символические ссылки".into(),
+                );
+            }
+            std::fs::canonicalize(&joined).map_err(|error| error.to_string())?
+        }
+        Err(error) if !must_exist && error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = joined.parent().ok_or("У пути файла отсутствует папка")?;
+            let canonical_parent =
+                std::fs::canonicalize(parent).map_err(|error| error.to_string())?;
+            if !canonical_parent.starts_with(root) {
+                return Err("Доступ за пределы проекта запрещён".into());
+            }
+            canonical_parent.join(joined.file_name().ok_or("Имя файла отсутствует")?)
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if !canonical.starts_with(root) {
+        return Err("Доступ за пределы проекта запрещён".into());
+    }
+    Ok(canonical)
+}
+
+fn direct_agent_list_files(root: &Path, relative: &str) -> Result<String, String> {
+    let path = if relative.is_empty() {
+        root.to_path_buf()
+    } else {
+        direct_agent_target(root, relative, true)?
+    };
+    let mut rows = std::fs::read_dir(path)
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .filter_map(|entry| {
+            let kind = entry.file_type().ok()?;
+            if kind.is_symlink() {
+                return None;
+            }
+            Some(format!(
+                "{}{}",
+                entry.file_name().to_string_lossy(),
+                if kind.is_dir() { "/" } else { "" }
+            ))
+        })
+        .take(300)
+        .collect::<Vec<_>>();
+    rows.sort();
+    Ok(rows.join("\n"))
+}
+
+fn direct_agent_read_file(root: &Path, relative: &str) -> Result<String, String> {
+    let path = direct_agent_target(root, relative, true)?;
+    if !path.is_file()
+        || std::fs::metadata(&path)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 512 * 1024
+    {
+        return Err("Файл отсутствует, не является обычным файлом или больше 512 KB".into());
+    }
+    std::fs::read_to_string(path)
+        .map_err(|error| format!("Не удалось прочитать текстовый файл: {error}"))
+}
+
+fn direct_agent_search(root: &Path, query: &str) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() || query.len() > 256 {
+        return Err("Поисковый запрос должен содержать от 1 до 256 символов".into());
+    }
+    let query_lower = query.to_lowercase();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut out = Vec::new();
+    let mut visited = 0usize;
+    let mut scanned_bytes = 0u64;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 12 || out.len() >= 100 || visited >= 4000 || scanned_bytes >= 32 * 1024 * 1024 {
+            break;
+        }
+        for entry in std::fs::read_dir(dir)
+            .map_err(|error| error.to_string())?
+            .flatten()
+        {
+            if out.len() >= 100 || visited >= 4000 || scanned_bytes >= 32 * 1024 * 1024 {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if matches!(
+                name.as_str(),
+                ".git" | "node_modules" | "target" | "dist" | "build"
+            ) {
+                continue;
+            }
+            let kind = match entry.file_type() {
+                Ok(kind) if !kind.is_symlink() => kind,
+                _ => continue,
+            };
+            if kind.is_dir() {
+                stack.push((entry.path(), depth + 1));
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let size = match entry.metadata() {
+                Ok(metadata) if metadata.len() <= 1024 * 1024 => metadata.len(),
+                _ => continue,
+            };
+            if scanned_bytes.saturating_add(size) > 32 * 1024 * 1024 {
+                break;
+            }
+            scanned_bytes += size;
+            visited += 1;
+            let text = match std::fs::read_to_string(entry.path()) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            for (line, content) in text.lines().enumerate() {
+                if content.to_lowercase().contains(&query_lower) {
+                    out.push(format!(
+                        "{}:{}: {}",
+                        entry
+                            .path()
+                            .strip_prefix(root)
+                            .unwrap_or(&entry.path())
+                            .display(),
+                        line + 1,
+                        content.chars().take(300).collect::<String>()
+                    ));
+                    if out.len() >= 100 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+fn direct_agent_write_file(
+    root: &Path,
+    args: &serde_json::Value,
+    changes: &mut Vec<AgentFileChange>,
+) -> Result<String, String> {
+    let relative = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Не указан путь файла")?;
+    let content = args
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Не указано содержимое файла")?;
+    if content.len() > 2_000_000 {
+        return Err("Содержимое файла превышает 2 MB".into());
+    }
+    let target = direct_agent_target(root, relative, false)?;
+    let before = if target.exists() {
+        Some(std::fs::read_to_string(&target).map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+    if target.is_dir() {
+        return Err("Нельзя заменить папку файлом".into());
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.starts_with(root) {
+            return Err("Папка файла находится за пределами проекта".into());
+        }
+    }
+    if before.as_deref() == Some(content) {
+        return Ok("Содержимое уже совпадает, изменений нет".into());
+    }
+    std::fs::write(&target, content).map_err(|error| error.to_string())?;
+    changes.push(AgentFileChange {
+        id: Uuid::new_v4().to_string(),
+        path: target.to_string_lossy().into_owned(),
+        before: before.clone(),
+        after: content.to_owned(),
+        existed_before: before.is_some(),
+    });
+    Ok(format!(
+        "Файл записан: {}",
+        target.strip_prefix(root).unwrap_or(&target).display()
+    ))
+}
+
+async fn direct_agent_run_command(root: &Path, command: &str) -> Result<String, String> {
+    if command.trim().is_empty() || command.len() > 8_000 {
+        return Err("Команда пуста или длиннее 8000 символов".into());
+    }
+    let mut process = if cfg!(windows) {
+        let mut cmd = tokio::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-lc", command]);
+        cmd
+    };
+    process
+        .current_dir(root)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("Не удалось запустить команду: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Не удалось прочитать stdout команды")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Не удалось прочитать stderr команды")?;
+    let stdout_task = tokio::spawn(read_command_output(stdout, 32_000));
+    let stderr_task = tokio::spawn(read_command_output(stderr, 32_000));
+    let status = tokio::time::timeout(Duration::from_secs(90), child.wait())
+        .await
+        .map_err(|_| "Команда остановлена по тайм-ауту 90 секунд".to_string())?
+        .map_err(|error| format!("Не удалось запустить команду: {error}"))?;
+    let stdout = stdout_task.await.map_err(|error| error.to_string())?;
+    let stderr = stderr_task.await.map_err(|error| error.to_string())?;
+    let mut text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    truncate_utf8(&mut text, 64_000);
+    Ok(format!(
+        "exit_code={}\n{}",
+        status.code().unwrap_or(-1),
+        text
+    ))
+}
+
+async fn read_command_output<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let keep = limit.saturating_sub(output.len()).min(read);
+        output.extend_from_slice(&chunk[..keep]);
+    }
+    output
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
+#[tauri::command]
+pub async fn respond_to_direct_agent_confirmation(
+    state: State<'_, DirectModelState>,
+    approval_id: String,
+    accept: bool,
+) -> Result<(), String> {
+    resolve_direct_agent_confirmation(&state, &approval_id, accept).await
+}
+
+async fn resolve_direct_agent_confirmation(
+    state: &DirectModelState,
+    approval_id: &str,
+    accept: bool,
+) -> Result<(), String> {
+    let sender = state
+        .approvals
+        .lock()
+        .await
+        .remove(approval_id)
+        .ok_or("Подтверждение уже истекло или задача остановлена")?;
+    sender
+        .send(accept)
+        .map_err(|_| "Удалённый агент уже завершил запрос".into())
+}
+
 async fn send_openai_compatible_chat(
     generation_state: Arc<AtomicU64>,
     base: String,
@@ -659,6 +1305,11 @@ async fn wait_for_direct_request_cancel(generation_state: &AtomicU64, generation
 #[tauri::command]
 pub fn cancel_direct_model_message(state: State<'_, DirectModelState>) {
     state.generation.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut approvals) = state.approvals.try_lock() {
+        for (_, sender) in approvals.drain() {
+            let _ = sender.send(false);
+        }
+    }
 }
 
 fn kilo_model_is_free_text(model: &serde_json::Value) -> bool {
@@ -1721,9 +2372,13 @@ pub fn stop_on_exit(app: &AppHandle) {
 mod tests {
     use super::{
         activate_uv_binaries, agent_connection, agent_server_runtime_args, completion_text,
+        direct_agent_list_files, direct_agent_read_file, direct_agent_run_command,
+        direct_agent_search, direct_agent_target, direct_agent_tools, direct_agent_write_file,
         find_uv_executable_index, interrupt_conversation, kilo_model_is_free_text,
-        parse_sha256_digest, respond_to_confirmation, reuse_or_stop_existing_agent, status,
-        AgentConfig, AgentServerState, UV_WINDOWS_ARCHIVE,
+        parse_sha256_digest, request_direct_agent_completion, resolve_direct_agent_confirmation,
+        respond_to_confirmation, reuse_or_stop_existing_agent, run_direct_agent_loop, status,
+        AgentConfig, AgentFileChange, AgentServerState, DirectAgentEventEmitter, DirectModelState,
+        UV_WINDOWS_ARCHIVE,
     };
     use std::fs;
     use std::io::Cursor;
@@ -2047,5 +2702,329 @@ mod tests {
             "supported_parameters": ["temperature"]
         });
         assert!(kilo_model_is_free_text(&no_tools));
+    }
+
+    #[test]
+    fn remote_agent_file_tools_stay_inside_project_and_record_undo_data() {
+        let root = std::env::temp_dir().join(format!("flux-agent-tools-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        fs::write(root.join("sample.txt"), "old content").unwrap();
+
+        assert!(direct_agent_target(&root, "../outside.txt", false).is_err());
+        assert_eq!(
+            direct_agent_read_file(&root, "sample.txt").unwrap(),
+            "old content"
+        );
+        assert!(direct_agent_list_files(&root, "")
+            .unwrap()
+            .contains("sample.txt"));
+        assert!(direct_agent_search(&root, "old content")
+            .unwrap()
+            .contains("sample.txt:1"));
+
+        let mut changes: Vec<AgentFileChange> = Vec::new();
+        direct_agent_write_file(
+            &root,
+            &serde_json::json!({"path":"sample.txt","content":"new content"}),
+            &mut changes,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("sample.txt")).unwrap(),
+            "new content"
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].before.as_deref(), Some("old content"));
+        assert_eq!(changes[0].after, "new content");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_agent_completion_sends_tool_schemas_and_parses_tool_calls() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        tauri::async_runtime::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let body_start = request.len();
+                request.resize(body_start + length, 0);
+                stream.read_exact(&mut request[body_start..]).unwrap();
+                let body =
+                    serde_json::from_slice::<serde_json::Value>(&request[body_start..]).unwrap();
+
+                let response = serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": serde_json::json!({"path":"sample.txt"}).to_string()
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                });
+                let response = response.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+                (headers, body)
+            });
+
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let generation = AtomicU64::new(7);
+            let messages = vec![serde_json::json!({"role":"user","content":"Read sample.txt"})];
+            let response = request_direct_agent_completion(
+                &client,
+                &format!("http://{address}/v1"),
+                "test-model",
+                &messages,
+                "test-key",
+                &generation,
+                7,
+            )
+            .await
+            .unwrap();
+            let (headers, body) = server.join().unwrap();
+            assert!(headers.contains("authorization: bearer test-key"));
+            assert_eq!(body["model"], "test-model");
+            assert_eq!(body["tool_choice"], "auto");
+            assert_eq!(body["tools"], direct_agent_tools());
+            assert_eq!(body["messages"][0]["content"], "Read sample.txt");
+            assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+            assert_eq!(
+                response["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                "read_file"
+            );
+            assert_eq!(
+                response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                r#"{"path":"sample.txt"}"#
+            );
+        });
+    }
+
+    #[test]
+    fn remote_agent_approval_is_one_shot_and_resolves_accept_or_reject() {
+        tauri::async_runtime::block_on(async {
+            let state = DirectModelState::default();
+            let (accepted_sender, accepted_receiver) = tokio::sync::oneshot::channel();
+            state
+                .approvals
+                .lock()
+                .await
+                .insert("approval-1".into(), accepted_sender);
+            resolve_direct_agent_confirmation(&state, "approval-1", true)
+                .await
+                .unwrap();
+            assert!(accepted_receiver.await.unwrap());
+            assert!(
+                resolve_direct_agent_confirmation(&state, "approval-1", true)
+                    .await
+                    .is_err()
+            );
+
+            let (rejected_sender, rejected_receiver) = tokio::sync::oneshot::channel();
+            state
+                .approvals
+                .lock()
+                .await
+                .insert("approval-2".into(), rejected_sender);
+            resolve_direct_agent_confirmation(&state, "approval-2", false)
+                .await
+                .unwrap();
+            assert!(!rejected_receiver.await.unwrap());
+        });
+    }
+
+    #[test]
+    fn remote_agent_command_runs_in_the_project_and_returns_output() {
+        tauri::async_runtime::block_on(async {
+            let root = std::env::temp_dir().join(format!("flux-agent-command-{}", Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            #[cfg(windows)]
+            let command = "Write-Output 'Flux command smoke'";
+            #[cfg(not(windows))]
+            let command = "printf 'Flux command smoke'";
+            let output = direct_agent_run_command(&root, command).await.unwrap();
+            assert!(output.starts_with("exit_code=0\n"), "{output}");
+            assert!(output.contains("Flux command smoke"), "{output}");
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn remote_agent_loop_waits_for_approval_before_writing_project_file() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        tauri::async_runtime::block_on(async {
+            let root = std::env::temp_dir().join(format!("flux-agent-loop-{}", Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            let output_file = root.join("created.txt");
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let read_request = |stream: &mut std::net::TcpStream| {
+                    let mut request = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    let body_start = request.len();
+                    request.resize(body_start + length, 0);
+                    stream.read_exact(&mut request[body_start..]).unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&request[body_start..]).unwrap()
+                };
+                let write_response = |stream: &mut std::net::TcpStream, body: serde_json::Value| {
+                    let body = body.to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                };
+
+                let (mut first, _) = listener.accept().unwrap();
+                let _ = read_request(&mut first);
+                let first_response = serde_json::json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"write-1","type":"function","function":{"name":"write_file","arguments":serde_json::json!({"path":"created.txt","content":"created after approval"}).to_string()}}]},"finish_reason":"tool_calls"}]});
+                write_response(&mut first, first_response);
+
+                let (mut second, _) = listener.accept().unwrap();
+                let second_request = read_request(&mut second);
+                assert_eq!(second_request["messages"][2]["role"], "tool");
+                assert!(second_request["messages"][2]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("created.txt"));
+                let final_response = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"The file was created."},"finish_reason":"stop"}]});
+                write_response(&mut second, final_response);
+            });
+
+            let state = Arc::new(DirectModelState::default());
+            let task_state = Arc::clone(&state);
+            let task_root = root.clone();
+            let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let task = tauri::async_runtime::spawn(async move {
+                run_direct_agent_loop(
+                    &task_state,
+                    task_root,
+                    format!("http://{address}/v1"),
+                    "test-model".into(),
+                    String::new(),
+                    vec![serde_json::json!({"role":"user","content":"Create created.txt"})],
+                    DirectAgentEventEmitter(move |event| {
+                        event_sender.send(event).map_err(|error| error.to_string())
+                    }),
+                )
+                .await
+            });
+
+            let approval_event = event_receiver.recv().await.unwrap();
+            let pending = approval_event.pending_approvals.unwrap();
+            assert_eq!(pending[0].tool_name, "write_file");
+            assert!(
+                !output_file.exists(),
+                "file must remain untouched before approval"
+            );
+            let approval_id = pending[0].action["approval_id"].as_str().unwrap();
+            resolve_direct_agent_confirmation(&state, approval_id, true)
+                .await
+                .unwrap();
+
+            let answer = task.await.unwrap().unwrap();
+            assert_eq!(answer, "The file was created.");
+            assert_eq!(
+                fs::read_to_string(&output_file).unwrap(),
+                "created after approval"
+            );
+            let mut saw_done = false;
+            while let Some(event) = event_receiver.recv().await {
+                if event.done {
+                    saw_done = true;
+                    assert_eq!(event.file_changes.unwrap().len(), 1);
+                }
+            }
+            assert!(saw_done);
+            server.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_agent_rejects_windows_junctions_that_escape_project() {
+        use std::os::windows::process::CommandExt;
+
+        let parent = std::env::temp_dir().join(format!("flux-agent-junction-{}", Uuid::new_v4()));
+        let root = parent.join("project");
+        let outside = parent.join("outside");
+        let junction = root.join("linked");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let command = format!(
+            "/C mklink /J \"{}\" \"{}\"",
+            junction.display(),
+            outside.display()
+        );
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg(command)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        assert!(direct_agent_read_file(&canonical_root, "linked\\secret.txt").is_err());
+        assert!(direct_agent_target(&canonical_root, "linked\\new.txt", false).is_err());
+
+        fs::remove_dir(&junction).unwrap();
+        fs::remove_dir_all(parent).unwrap();
     }
 }

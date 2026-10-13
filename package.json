@@ -1,7 +1,7 @@
 {
   "name": "flux-hands",
   "private": true,
-  "version": "1.0.16",
+  "version": "1.0.17",
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-vite.mjs",

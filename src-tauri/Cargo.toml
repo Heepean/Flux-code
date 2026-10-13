@@ -1,6 +1,6 @@
 [package]
 name = "flux-hands"
-version = "1.0.16"
+version = "1.0.17"
 description = "Local-first AI development studio"
 authors = ["Flux Code"]
 edition = "2021"

@@ -1117,6 +1117,9 @@ fn start_local_model(config: StartModel, state: State<Runtime>) -> Result<String
     ])
     .arg("--ctx-size")
     .arg(context.to_string())
+    // Flux Hands runs one local agent task at a time. Avoid llama.cpp's
+    // automatic multi-slot context allocation, which reserves extra KV cache.
+    .args(["--parallel", "1"])
     .arg("--n-gpu-layers")
     .arg(gpu_layers.to_string())
     .args(["--alias", "local-model"])
@@ -1192,15 +1195,23 @@ fn switch_local_model<T>(
 }
 
 fn required_system_memory(model_bytes: u64, gpu_layers: i32, context: u32) -> u64 {
-    // Full GPU offload keeps most quantized weights in VRAM. Retain headroom
-    // for the runtime, context/KV cache, and Windows instead of counting the
-    // whole GGUF as resident system RAM.
-    let resident_weights = if gpu_layers == -1 {
-        (model_bytes / 10).max(512 * 1024 * 1024)
+    // llama.cpp's Windows HIP process retained almost the full GGUF in its
+    // working set even with every layer offloaded. Do not assume GPU offload
+    // removes the model from system RAM. Partial layer sizes also vary by
+    // architecture, so retain all weights for every setting.
+    let resident_weights = model_bytes;
+    let context_bytes_per_token = if gpu_layers == -1 {
+        32 * 1024
     } else {
-        model_bytes
+        256 * 1024
     };
-    let context_reserve = u64::from(context).saturating_mul(256 * 1024);
+    let context_reserve = u64::from(context)
+        .saturating_mul(context_bytes_per_token)
+        .min(if gpu_layers == -1 {
+            2 * 1024 * 1024 * 1024
+        } else {
+            u64::MAX
+        });
     resident_weights
         .saturating_add(context_reserve)
         .saturating_add(768 * 1024 * 1024)
@@ -1483,7 +1494,9 @@ pub fn run() {
             openhands::get_agent_server_status,
             openhands::send_agent_message,
             openhands::send_direct_model_message,
+            openhands::send_direct_model_agent,
             openhands::cancel_direct_model_message,
+            openhands::respond_to_direct_agent_confirmation,
             openhands::interrupt_agent_conversation,
             openhands::respond_to_agent_confirmation,
             openhands::save_model_provider_key,
@@ -1593,15 +1606,29 @@ mod workspace_search_tests {
     }
 
     #[test]
-    fn gpu_offload_memory_preflight_reserves_context_without_counting_full_model_in_ram() {
+    fn gpu_offload_memory_preflight_keeps_model_and_context_ram_headroom() {
         let model_bytes = 6_725_900_288;
         let cpu_required = required_system_memory(model_bytes, 0, 16_384);
         let gpu_required = required_system_memory(model_bytes, -1, 16_384);
         assert!(cpu_required > model_bytes);
-        assert!(gpu_required < model_bytes);
-        assert!(gpu_required > 5 * 1024 * 1024 * 1024);
-        assert!(gpu_required < 6 * 1024 * 1024 * 1024);
+        assert!(gpu_required > 7 * 1024 * 1024 * 1024);
+        assert!(gpu_required < 8 * 1024 * 1024 * 1024);
+        assert!(gpu_required > model_bytes);
         assert!(required_system_memory(model_bytes, -1, 32_768) > gpu_required);
+        assert_eq!(
+            required_system_memory(model_bytes, 20, 16_384),
+            cpu_required
+        );
+        assert_eq!(
+            required_system_memory(model_bytes, 40, 16_384),
+            cpu_required
+        );
+        assert_eq!(required_system_memory(model_bytes, 0, 16_384), cpu_required);
+
+        let ternary_bytes = 7_206_168_928;
+        let ternary_gpu_required = required_system_memory(ternary_bytes, -1, 16_384);
+        assert!(ternary_gpu_required > 7_750_000_000);
+        assert!(required_system_memory(ternary_bytes, 0, 16_384) > 11 * 1024 * 1024 * 1024);
     }
 
     #[test]
