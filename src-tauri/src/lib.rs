@@ -150,7 +150,6 @@ fn select_llama_asset(releases: Vec<LlamaRelease>, suffix: &str) -> Option<(Stri
     })
 }
 
-#[cfg(windows)]
 fn is_amd_radeon_adapter(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.contains("amd") || name.contains("radeon")
