@@ -5,6 +5,7 @@ on:
     tags:
       - 'v*'
       - 'publish-v*'
+      - 'rebuild-v*'
 
 permissions:
   contents: write
@@ -23,7 +24,9 @@ jobs:
         shell: bash
         run: |
           version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          release_tag="${GITHUB_REF_NAME#publish-}"
+          release_tag="$GITHUB_REF_NAME"
+          release_tag="${release_tag#publish-}"
+          release_tag="${release_tag#rebuild-}"
           if [[ "$release_tag" != "v${version}" ]]; then
             echo "Tag $release_tag does not match version $version." >&2
             exit 1
@@ -32,14 +35,29 @@ jobs:
           echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "notes_version=${version%%-beta.*}" >> "$GITHUB_OUTPUT"
       - id: draft
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: Flux Hands ${{ steps.version.outputs.tag }}
-          generate_release_notes: false
-          prerelease: ${{ contains(steps.version.outputs.tag, '-beta.') }}
-          draft: true
-          body_path: .github/release-notes/v${{ steps.version.outputs.notes_version }}.md
+        name: Create or reuse GitHub draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          NOTES_FILE: .github/release-notes/v${{ steps.version.outputs.notes_version }}.md
+        run: |
+          set -euo pipefail
+          if ! release=$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null); then
+            args=("$RELEASE_TAG" --draft --title "Flux Hands $RELEASE_TAG" --notes-file "$NOTES_FILE")
+            if [[ "$RELEASE_TAG" == *-beta.* ]]; then args+=(--prerelease); fi
+            gh release create "${args[@]}"
+            release=$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG")
+          fi
+          if [[ $(jq -r '.tag_name' <<<"$release") != "$RELEASE_TAG" || $(jq -r '.draft' <<<"$release") != true ]]; then
+            echo "::error title=Unexpected release state::Release $RELEASE_TAG exists but is not the expected draft."
+            exit 1
+          fi
+          release_id=$(jq -r '.id' <<<"$release")
+          echo "id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "Using GitHub draft release $release_id for $RELEASE_TAG."
   release:
     needs: prepare_release
     runs-on: windows-latest
