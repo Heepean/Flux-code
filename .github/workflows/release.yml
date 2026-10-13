@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+      - 'publish-v*'
 
 permissions:
   contents: write
@@ -13,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.value }}
+      tag: ${{ steps.version.outputs.tag }}
       release_id: ${{ steps.draft.outputs.id }}
     steps:
       - uses: actions/checkout@v4
@@ -21,19 +23,21 @@ jobs:
         shell: bash
         run: |
           version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match version $version." >&2
+          release_tag="${GITHUB_REF_NAME#publish-}"
+          if [[ "$release_tag" != "v${version}" ]]; then
+            echo "Tag $release_tag does not match version $version." >&2
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "notes_version=${version%%-beta.*}" >> "$GITHUB_OUTPUT"
       - id: draft
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Flux Hands ${{ github.ref_name }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Flux Hands ${{ steps.version.outputs.tag }}
           generate_release_notes: false
-          prerelease: ${{ contains(github.ref_name, '-beta.') }}
+          prerelease: ${{ contains(steps.version.outputs.tag, '-beta.') }}
           draft: true
           body_path: .github/release-notes/v${{ steps.version.outputs.notes_version }}.md
   release:
@@ -98,7 +102,7 @@ jobs:
         id: assets
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.prepare_release.outputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
           $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
@@ -145,10 +149,10 @@ jobs:
       - id: upload_windows_assets
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Flux Hands ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare_release.outputs.tag }}
+          name: Flux Hands ${{ needs.prepare_release.outputs.tag }}
           generate_release_notes: false
-          prerelease: ${{ contains(github.ref_name, '-beta.') }}
+          prerelease: ${{ contains(needs.prepare_release.outputs.tag, '-beta.') }}
           draft: true
           overwrite_files: true
           body_path: .github/release-notes/v${{ steps.assets.outputs.notes_version }}.md
@@ -199,18 +203,20 @@ jobs:
         run: npm run tauri -- android build --debug --apk --target aarch64 --config src-tauri/tauri.android.conf.json
       - name: Prepare APK release asset
         id: android_asset
+        env:
+          RELEASE_TAG: ${{ needs.prepare_release.outputs.tag }}
         run: |
           apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*arm64-v8a-debug*.apk' | head -n 1)
           if [ -z "$apk" ]; then apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1); fi
           test -n "$apk"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
-          cp "$apk" "$RUNNER_TEMP/Flux.Hands_${GITHUB_REF_NAME}_android-arm64-debug.apk"
-          echo "apk=$RUNNER_TEMP/Flux.Hands_${GITHUB_REF_NAME}_android-arm64-debug.apk" >> "$GITHUB_OUTPUT"
+          cp "$apk" "$RUNNER_TEMP/Flux.Hands_${RELEASE_TAG}_android-arm64-debug.apk"
+          echo "apk=$RUNNER_TEMP/Flux.Hands_${RELEASE_TAG}_android-arm64-debug.apk" >> "$GITHUB_OUTPUT"
       - name: Upload Android APK to GitHub Release
         id: upload_android_asset
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare_release.outputs.tag }}
           files: ${{ steps.android_asset.outputs.apk }}
           fail_on_unmatched_files: true
           draft: true
@@ -224,17 +230,14 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.prepare_release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_ID: ${{ needs.prepare_release.outputs.release_id }}
-          WINDOWS_ASSETS: ${{ needs.release.outputs.assets }}
-          ANDROID_ASSETS: ${{ needs.android.outputs.assets }}
         run: |
           $ErrorActionPreference = 'Stop'
           $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
           $base = "https://api.github.com/repos/$env:REPOSITORY"
           if (-not $env:RELEASE_ID) { throw 'The draft release action did not return a release ID.' }
-          if (-not $env:WINDOWS_ASSETS -or -not $env:ANDROID_ASSETS) { throw 'A platform release action did not return uploaded asset metadata.' }
           $version = $env:RELEASE_TAG -replace '^v', ''
           $expected = @(
             "Flux.Hands_${version}_x64-setup.exe",
@@ -243,16 +246,24 @@ jobs:
             "Flux.Hands_$($env:RELEASE_TAG)_android-arm64-debug.apk"
           )
           $msiName = "Flux Hands_${version}_x64_en-US.msi"
-          $windowsAssets = @($env:WINDOWS_ASSETS | ConvertFrom-Json)
-          $androidAssets = @($env:ANDROID_ASSETS | ConvertFrom-Json)
-          $assets = @($windowsAssets) + @($androidAssets)
+          $release = Invoke-RestMethod -Method Get -Uri "$base/releases/$env:RELEASE_ID" -Headers $headers
+          if ($release.tag_name -ne $env:RELEASE_TAG -or -not $release.draft) { throw 'The expected GitHub draft release was not found.' }
+          $assets = @($release.assets)
           $names = @($assets | ForEach-Object { $_.name })
-          $missing = @($expected | Where-Object { $_ -notin $names })
-          $msiAssets = @($assets | Where-Object { $_.name -eq $msiName })
-          if ($missing.Count -gt 0 -or $msiAssets.Count -ne 1) {
-            throw "Uploaded asset outputs did not pass verification. Missing: $($missing -join ', '); matching MSI count: $($msiAssets.Count). Returned names: $($names -join ', ')."
+          $requiredAssets = @($expected) + $msiName
+          $assetProblems = @()
+          foreach ($requiredName in $requiredAssets) {
+            $matches = @($assets | Where-Object { $_.name -eq $requiredName })
+            if ($matches.Count -ne 1) {
+              $assetProblems += "$requiredName count=$($matches.Count)"
+            } elseif ($matches[0].size -le 0) {
+              $assetProblems += "$requiredName is empty"
+            }
           }
-          $verifiedAssets = @($assets | Where-Object { $_.name -in $expected }) + $msiAssets
+          if ($assetProblems.Count -gt 0) {
+            throw "Draft release assets did not pass verification. Issues: $($assetProblems -join '; '); returned names: $($names -join ', ')."
+          }
+          $verifiedAssets = @($assets | Where-Object { $_.name -in $requiredAssets })
           foreach ($asset in $verifiedAssets) {
             if ($asset.size -le 0) { throw "Release asset is empty: $($asset.name)" }
           }
