@@ -524,6 +524,22 @@ fn completion_text(value: &serde_json::Value) -> Result<String, String> {
             .or_else(|| error.as_str())
             .filter(|message| !message.trim().is_empty())
             .unwrap_or("провайдер не указал причину");
+        let nested = error
+            .pointer("/metadata/previous_errors/0/raw")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                let raw = error.pointer("/metadata/raw")?.as_str()?;
+                let raw: serde_json::Value = serde_json::from_str(raw).ok()?;
+                raw.get("message")?.as_str().map(str::to_owned)
+            })
+            .filter(|detail| !detail.trim().is_empty() && !message.contains(detail.as_str()));
+        let detail = if let Some(nested) = nested {
+            format!("{message}: {nested}")
+        } else {
+            message.to_owned()
+        };
+        let detail = detail.chars().take(512).collect::<String>();
         let code = error
             .get("code")
             .map(|code| match code {
@@ -533,7 +549,7 @@ fn completion_text(value: &serde_json::Value) -> Result<String, String> {
             .filter(|code| !code.is_empty() && code != "null")
             .map(|code| format!(" ({code})"))
             .unwrap_or_default();
-        return Err(format!("Ошибка удалённого провайдера{code}: {message}"));
+        return Err(format!("Ошибка удалённого провайдера{code}: {detail}"));
     }
     let content = value
         .pointer("/choices/0/message/content")
@@ -2596,6 +2612,26 @@ mod tests {
         let error = completion_text(&response).unwrap_err();
         assert!(error.contains("503"));
         assert!(error.contains("Service temporarily overloaded"));
+    }
+
+    #[test]
+    fn direct_model_response_surfaces_nested_rate_limit_without_gateway_identity() {
+        let response = serde_json::json!({
+            "error": {
+                "message": "Provider returned error",
+                "code": 429,
+                "metadata": {
+                    "previous_errors": [{
+                        "raw": "model is temporarily rate-limited upstream; retry shortly"
+                    }]
+                }
+            },
+            "user_id": "org_private_identifier"
+        });
+        let error = completion_text(&response).unwrap_err();
+        assert!(error.contains("429"));
+        assert!(error.contains("temporarily rate-limited upstream"));
+        assert!(!error.contains("org_private_identifier"));
     }
 
     #[test]
