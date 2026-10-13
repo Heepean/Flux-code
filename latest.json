@@ -1,0 +1,11 @@
+{
+  "version": "1.0.18-beta.3",
+  "platforms": {
+    "windows-x86_64": {
+      "url": "https://github.com/Heepean/Flux-code/releases/download/v1.0.18-beta.3/Flux.Hands_1.0.18-beta.3_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTL1BnYkgzTnFiMWxVZjY1dEV2dXZvdG4rNGpINGxhU1JsYWM4RFdtY0lCVzNrNWwwbjhSaS9LbXNZZHd1bElaMVlLWFZoaUJxR1Uvbi9veTBzSGpDd2pwRnZpV0YzU0E4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTIyODY0CWZpbGU6Rmx1eCBIYW5kc18xLjAuMTgtYmV0YS4zX3g2NC1zZXR1cC5leGUJdmVyc2lvbjoxLjAuMTgtYmV0YS4zCjlIMG1wSjRvL0pQeFNvUFBrUnRVRExES2hWNFVnaDVNWUJSZHdBbjNMaC9PWk5YNEZJMGtsaWZhN0Y2dExqMjVDd1BVQTI4cWloNE9tcXJ2emxIZkFBPT0K"
+    }
+  },
+  "notes": "Flux Hands — локальная AI-среда разработки",
+  "pub_date": "2026-10-13T20:22:45.0378305Z"
+}
