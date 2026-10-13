@@ -1,16 +1,24 @@
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param()
+
 $ErrorActionPreference = 'Stop'
 
 $repository = $env:GITHUB_REPOSITORY
 $token = $env:GITHUB_TOKEN
-if (-not $repository -or -not $token) {
-    throw 'GITHUB_REPOSITORY and GITHUB_TOKEN are required.'
+if (-not $repository) {
+    throw 'GITHUB_REPOSITORY is required.'
+}
+if (-not $token -and -not $WhatIfPreference) {
+    throw 'GITHUB_TOKEN is required unless -WhatIf is used.'
 }
 
 $headers = @{
-    Authorization = "Bearer $token"
     Accept = 'application/vnd.github+json'
     'X-GitHub-Api-Version' = '2022-11-28'
     'User-Agent' = 'Flux-Hands-Release-Cleanup'
+}
+if ($token) {
+    $headers.Authorization = "Bearer $token"
 }
 
 $base = "https://api.github.com/repos/$repository"
@@ -21,6 +29,9 @@ if ($currentTag -notmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
     exit 0
 }
 $current = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$currentTag" -Headers $headers
+if ($current.draft) {
+    throw "Refusing cleanup because current release '$currentTag' is still a draft."
+}
 $releases = @()
 $page = 1
 do {
@@ -38,9 +49,12 @@ foreach ($release in $staleReleases) {
             continue
         }
 
-        Invoke-RestMethod -Method Delete -Uri "$base/releases/assets/$($asset.id)" -Headers $headers | Out-Null
-        Write-Host "Removed stale release asset $($release.tag_name)/$($asset.name)"
-        $removed++
+        $target = "$($release.tag_name)/$($asset.name)"
+        if ($PSCmdlet.ShouldProcess($target, 'Delete stale GitHub release asset')) {
+            Invoke-RestMethod -Method Delete -Uri "$base/releases/assets/$($asset.id)" -Headers $headers | Out-Null
+            Write-Host "Removed stale release asset $target"
+            $removed++
+        }
     }
 }
 

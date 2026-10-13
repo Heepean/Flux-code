@@ -3,6 +3,7 @@ dist/
 src-tauri/target/
 src-tauri/.tauri/
 src-tauri/gen/android/
+src-tauri/resources/llama-runtime/prism-hip/
 *.log
 *.tmp
 OpenHands-1.26.0.zip

@@ -1,5 +1,7 @@
 # Flux Code / Flux Hands project audit
 
+> **Current release status (2026-10-12):** The historical snapshots below record what was known at each audit point. The latest follow-up at the end of this file supersedes earlier statements that v1.0.15 was unpublished: `v1.0.15-beta.1` is public with Windows assets and an Android ARM64 APK. The APK has not been installed on a device.
+
 Audit snapshot: 2026-10-12, local checkout `D:\Flux code\repo-check` at `f0fb1ad` with a clean worktree; `v1.0.14-beta.2` is running Actions workflow 38220704939 for earlier commit `0634555`. Flux Code and Flux Hands refer to this one project. This is a source/build and focused runtime audit, not a claim that every workflow was exercised on a clean user machine.
 
 ## Architecture observed
@@ -25,7 +27,7 @@ No embedded VS Code or OpenHands source tree is present in this checkout. The ap
 | Save editor content | Explicit Save/Ctrl+S, per-tab dirty state | `npm run build` passed; native file editing/save, failed-save recovery, external changes and reload behavior remain unverified |
 | Workspace text search | Implemented in Rust; skips selected directories and large/binary files | Rust unit tests pass (15 total at `f0fb1ad`) |
 | Git branch/status and changed file opening | Implemented (read-only status) | Rust temp-repository test passes |
-| Local GGUF launch/switch | Implemented with CPU runtime bootstrap, RAM check and one child process | Real small GGUF loaded through native app commands; health and chat passed, then stop closed the port. Full user models are refused on this machine's available RAM |
+| Local GGUF launch/switch | Implemented with CPU/Vulkan runtime bootstrap, model-format-aware PrismML selection, RAM check and one child process | On RX 7700 XT, Nemotron Cascade 8B Q6_K passed a local completion on CPU (~6 tokens/s) and Vulkan GPU (~57 tokens/s). Ternary Bonsai 2 27B PQ2_0 required PrismML; on Vulkan it loaded and passed a correct 2+2 answer (~40 tokens/s). PrismML CPU also loaded and completed, but consumed nearly all available RAM (free RAM fell to ~0.34 GB) and was slow (~4 tokens/s). These were direct llama-server runs, not yet through the native app's new runtime bootstrap |
 | Hugging Face model search/download | Implemented for desktop | Source reviewed; no network/download scenario run here |
 | OpenHands local/remote task execution | Implemented using API/event polling; interrupt support is included in `f0fb1ad` | Earlier dev-app E2E covered Kilo Free events and approval. Interrupt endpoint path, session header, and remote/local base selection pass an HTTP mock/unit test; cancellation against a running live conversation is not yet verified |
 | Kilo free catalog | Implemented against live Kilo endpoint | Anonymous Kilo Auto Free request through OpenHands 1.26.0 returned the expected marker with zero reported model cost; tool-capable action flow and provider limits remain in scope |
@@ -40,7 +42,7 @@ No embedded VS Code or OpenHands source tree is present in this checkout. The ap
 
 ### P0 — Agent action confirmation needs real runtime proof
 
-The source originally sent `NeverConfirm`. New conversations use `AlwaysConfirm`; reused conversations call the Agent Server confirmation-policy endpoint, poll pending ActionEvents and present tool/action details with explicit approve/reject controls. A dev-app E2E test against OpenHands 1.26.0 and Kilo Free verified both outcomes in a disposable workspace: the file did not exist before either decision; rejection left it absent and reported that execution stopped; approval created only the proposed file with the requested bytes. The conversation also resumed after the Agent Server process was restarted and returned `CONVERSATION_CONTINUED_OK`, exercising the camelCase continuation and confirmation command arguments. Server startup logs a non-fatal browser-tool preload error (`AttributeError: 'Server' object has no attribute 'list_tools'`) and then reports ready. Remaining: prove the runtime cannot escape its workspace, test confirmation across other tool classes, and run file-editor rollback against a live Tauri/OpenHands task.
+The source originally sent `NeverConfirm`. New conversations use `AlwaysConfirm`; reused conversations call the Agent Server confirmation-policy endpoint, poll pending ActionEvents and present tool/action details with explicit approve/reject controls. A dev-app E2E test against OpenHands 1.26.0 and Kilo Free verified both outcomes in a disposable workspace: the file did not exist before either decision; rejection left it absent and reported that execution stopped; approval created only the proposed file with the requested bytes. The conversation also resumed after the Agent Server process was restarted and returned `CONVERSATION_CONTINUED_OK`, exercising the camelCase continuation and confirmation command arguments. That preload error came from FastMCP 4 resolving MCP 2 against browser-use's MCP 1 decorator API. The runtime pins FastMCP 3/MCP 1; a fresh OpenHands 1.26.0 server now starts browser-tool preload successfully. Remaining: prove the runtime cannot escape its workspace, test confirmation across other tool classes, and run file-editor rollback against a live Tauri/OpenHands task.
 
 ### P0 — Workspace boundary only covers Flux Hands file commands
 
@@ -52,7 +54,7 @@ Desktop native state records the active root from the OS folder picker and persi
 
 ### P0 — Local model command mismatch fixed; broad provider verification remains
 
-The UI sent camelCase `modelPath` and `gpuLayers` to `start_local_model`; Rust expected snake_case in the nested struct, so UI-triggered GGUF startup failed before spawning the server. `StartModel` now deserializes camelCase and a regression test covers this. The dev app's native command was re-run successfully with a temporary 1B model. Kilo was also verified through the local OpenHands server; other providers and full-size local models remain hardware/provider dependent.
+The UI sent camelCase `modelPath` and `gpuLayers` to `start_local_model`; Rust expected snake_case in the nested struct, so UI-triggered GGUF startup failed before spawning the server. `StartModel` now deserializes camelCase and a regression test covers this. A current local OpenHands 1.26.0 + Nemotron Vulkan run at 16K context answered and completed file_editor create/str_replace actions in a disposable workspace after approvals. The first action had a content typo and the model incorrectly claimed it was exact; a follow-up generated the correct replacement, which was independently read back from disk. Native Tauri model-selection/auto-start and clean installer flows remain unverified.
 
 ### P1 — UI state persistence needs runtime validation
 
@@ -174,4 +176,73 @@ This audit reviewed source, CI/release status and artifacts, ran a real small-GG
 - The uploaded APK is 171 MB and debug-signed for testing. CI signature verification passed, but no Android device is connected; installation and runtime behavior remain unverified. The local optimized debug-signed candidate remains a separate 17 MB file and is not the uploaded CI artifact.
 - Production frontend build passed (`npm run build`) and the complete native Rust suite passed (17 tests). This includes safe project-folder creation/path traversal rejection and workspace boundary tests.
 - In a local browser preview, created a new chat and confirmed it appeared in the chat list after a page reload. The project dialog showed both “Открыть существующую папку” and the new-folder flow. This verifies browser UI and local chat persistence only; native folder-picker, directory activation, and desktop transcript switching remain unverified.
-- The optimized Android APK remains locally verified at `artifacts/Flux.Hands_1.0.15-beta.1_android-arm64.apk`; there is still no public APK download URL until a release is published and its asset is checked.
+- The optimized Android APK remains a local candidate at `artifacts/Flux.Hands_1.0.15-beta.1_android-arm64.apk`, separate from the larger debug APK uploaded to the public prerelease above.
+
+## Follow-up — per-project active chat restoration — 2026-10-12
+
+- Persisted the selected chat ID under a workspace-specific local-storage key and restore that conversation on project activation/reload, falling back to that workspace's most recent chat if the saved ID no longer exists.
+- `npm run build` and `git diff --check` pass. This validates compilation and patch formatting only; native desktop restart/switch behavior remains unverified. This checkout does not define the `lint:ui` npm script.
+
+## Follow-up — local model switch memory preflight — 2026-10-12
+
+- Fixed `start_local_model` to terminate and wait for the previous llama.cpp process before checking available RAM for the selected model. The model child lock remains held across shutdown and the preflight, so two model starts cannot overlap this transition.
+- Added a Windows regression test that starts a disposable process and verifies the preflight callback only runs after that process has been stopped. `cargo test --manifest-path src-tauri/Cargo.toml` passed all 18 tests; strict `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `npm run build`, and `git diff --check` passed.
+- 2026-10-12 follow-up: detected AMD Radeon RX 7700 XT (12,272 MiB Vulkan memory) and 15.6 GB system RAM. Direct local inference succeeded for both user GGUFs on CPU and GPU. The 27B PQ2_0 model needs PrismML; upstream llama.cpp rejects GGUF tensor type 142. Added CPU/Vulkan backend selection and verified-hash runtime bootstrap, with PrismML selected for PQ2_0/PTQ1_0. Production build, 18 Rust tests, strict Clippy and formatting passed. Native Tauri invocation of the new installer path and clean-install runtime download still need verification. Keep context at a practical value (default 4096); context 512 was enough for arithmetic but truncated a longer explanation.
+
+
+## Follow-up — editor dirty-state protection — 2026-10-12
+
+- Switching projects now warns before discarding unsaved edits and clears old workspace buffers only after the switch is accepted. Closing a dirty editor tab also asks before discarding its in-memory draft; rejecting the prompt keeps the tab open.
+- `npm run build`, all 18 Rust tests, strict Clippy, Rust formatting and `git diff --check` passed. Native confirmation-dialog interactions remain unverified because the available computer-use surface does not expose the Tauri window.
+pm run build, all 18 Rust tests, strict Clippy, Rust formatting and git diff --check passed. Native confirmation-dialog interactions remain unverified because the available computer-use surface does not expose the Tauri window.
+- Fixed the copied command prefix and ran `npm run build`, `cargo fmt --check`, all 18 Rust tests, strict Clippy and `git diff --check` successfully.
+
+## Follow-up — local Agent Server startup and context — 2026-10-12
+
+- Desktop local-model flow now waits for llama-server readiness and then starts/reuses the OpenHands Agent Server with the active workspace and local model endpoint. If Agent Server startup fails, the UI keeps the model running and reports the partial-ready state. Android remains remote-server-only.
+- Raised the local-model default/minimum context to 16,384 tokens. An 8,192-token Nemotron Cascade 8B Q6_K run truncated the OpenHands tool prompt; with 16,384, OpenHands 1.26.0 generated a real `TerminalAction` and paused at confirmation. The attempted follow-up response targeted the previous rejected action, so an approved tool execution is not claimed.
+- Direct process integration confirmed Vulkan llama-server plus OpenHands Agent Server health and conversation creation on this Windows/RX 7700 XT machine. This was a manually launched runtime probe, not a Tauri UI/native auto-start test. Release assets and Android remote-device behavior were not tested in this pass.
+- `npm run build`, all 18 Rust tests, strict Clippy, Rust formatting and `git diff --check` pass.
+
+## Follow-up — refreshed Flux Hands application icons — 2026-10-12
+
+- Replaced the Tauri PNG/ICO icon set with the image supplied by the user. Kept the original image and an Android icon manifest/background so the launcher artwork can be regenerated consistently. Release workflow now regenerates platform icons after Android project initialization.
+- `npm run build` and `npm run tauri -- build --debug --no-bundle` passed; the Windows app binary was produced with the refreshed icon assets. Android launcher resources were regenerated, but local APK packaging stopped when Windows denied creation of the Android `.so` symbolic link (`Developer Mode`/symlink privilege is disabled). No new APK or public release is claimed.
+
+## Follow-up — local Nemotron Agent Server approval cycle — 2026-10-12
+
+- Started the user's Nemotron Cascade 8B Q6_K GGUF through Vulkan llama-server (`n_ctx=16384`) and OpenHands Agent Server 1.26.0 against a new disposable workspace. Server health returned `ok`; the conversation reached `waiting_for_confirmation` with the proposed action `Write-Output 'FLUX_APPROVED_EXECUTED'`.
+- Posted approval only after verifying that conversation was waiting. OpenHands returned HTTP 200, executed the proposed PowerShell command, emitted a terminal `ObservationEvent` with `FLUX_APPROVED_EXECUTED`, and finished the conversation. This closes the earlier incorrect approval-target attempt for the direct local runtime path.
+- Added a Rust unit test covering the app's approval route, API-key header, and `accept=true` payload. `cargo test` passed 19 tests; `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `npm run build`, and `git diff --check` pass. Temporary Agent Server and llama.cpp processes were stopped.
+- The live cycle used manually launched processes and direct HTTP, not the native Tauri window. Automatic local model→Agent Server startup and clicking approval in the desktop UI remain unverified; do not treat this as full app E2E.
+
+## Follow-up — OpenHands runtime bootstrap and editor conflict protection — 2026-10-12
+
+- The pinned uv bootstrap validates the official GitHub SHA-256 (or Astral sidecar fallback), limits archive and executable sizes, stages extraction, accepts flat and legacy nested uv archive layouts, and restores both prior executables if activation fails. Tests cover API/sidecar checksums, archive path layouts, and rollback when the second binary is missing.
+- Downloaded uv 0.13.0's Windows x64 archive and independently verified its 15,722,003-byte payload digest against GitHub API metadata and the published sidecar. The actual release stores `uv.exe` and `uvx.exe` at the archive root; the loader now supports that layout. A unit test confirms both flat and nested names resolve.
+- The actual installed OpenHands 1.26.0 package cache confirms new conversations use `LocalWorkspace`; its workspace path is not an OS sandbox and agent terminal commands run under the desktop user's account. Native Flux Hands file commands enforce the selected root, but OpenHands commands do not. The device has no Docker CLI, so Docker isolation has not been implemented or verified.
+- Native editor saves now send the version originally opened. Rust rejects save if the file changed on disk and preserves the external bytes; the UI retains the unsaved draft and explains close/reopen recovery. Two tests cover conflict preservation and the ordinary save path. The actual Tauri save/recovery interaction is not yet exercised.
+- `npm run build`, `cargo test` (25 tests), strict Clippy, Rust formatting, and `git diff --check` passed. Existing local modifications remain uncommitted.
+- Rebuilt the debug Tauri desktop executable from this working tree (`npm run tauri -- build --debug --no-bundle`) after the editor change and added agent-permission wording beside the task composer. Computer-use reports no native apps/windows, so the generated desktop binary was not launched or UI-tested; the audit evidence remains code/build/test level for these UI changes.
+- Public GitHub Releases API currently shows v1.0.15-beta.1 with five non-empty assets and v1.0.8 as latest stable with four; all intermediate releases have no assets. Cleanup script dry-run against the live public API kept both active releases and found zero old installer assets to delete. `gh` CLI is not installed, so direct authenticated cleanup or upload cannot be done from this environment.
+- Cleanup script now supports PowerShell `-WhatIf`, performs read-only preview without a GitHub token, and refuses to delete when the current release remains a draft. Live `-WhatIf` confirmed the current public release set requires no removals.
+- Tauri now intercepts desktop-window close while an editor buffer is dirty, an agent task runs, or a model is starting; users can cancel closing or explicitly confirm discarding/interrupting. This is source-level only until a native window is available.
+
+## Follow-up — desktop shell controls — 2026-10-12
+
+- Replaced inert sidebar and settings controls with working actions. Both sidebar buttons hide/reopen the explorer panel; the bottom settings control opens model/runtime configuration.
+- `npm run build` passed, and the Vite preview verified collapse, restore, and settings navigation. This does not replace a native Tauri-window smoke test.
+
+
+## Follow-up — browser-tool dependency compatibility — 2026-10-12
+
+- Pinned the OpenHands 1.26.0 Agent Server's FastMCP/MCP dependencies to compatible major versions. The resolved package set now initializes the installed browser-use MCP server; this fixes the known preload exception at the package/API level.
+- Verified with 26 Rust unit tests, Clippy with warnings denied, cargo fmt --check, and git diff --check. Native Tauri startup and browser interaction in an actual agent task remain unverified.
+
+## Follow-up — rolling llama.cpp install, AMD GPU and local OpenHands — 2026-10-12
+
+- The llama.cpp GitHub API currently returns rolling Windows assets as prereleases; selecting only non-prerelease builds left a fresh install with no runtime candidate. Runtime selection now accepts the newest compatible asset from the release list and still requires GitHub's SHA-256 before extraction. A regression test covers the rolling prerelease asset. Current Windows Vulkan asset `llama-b11565-bin-win-vulkan-x64.zip` (32,084,447 bytes) matched API digest `d21649a9cc9dc063d88848ffa9ae3986222c9e953f2f950e993e00e49cedfe21`.
+- Runtime selection detects an AMD Radeon adapter and routes Prism PQ1/PQ2 models to the Windows HIP asset. Ordinary GGUF models continue to use Vulkan. This machine reports AMD Radeon RX 7700 XT; its downloaded Vulkan build loaded the real Nemotron Cascade 8B Q6_K at 16,384 context, served `/v1/models`, and generated at roughly 33–49 tokens/second under the test prompts.
+- A separate OpenHands 1.26.0 server started with the pinned FastMCP 3/MCP 1 environment, initialized browser-tool preload, and used the local Vulkan endpoint. A simple task finished. In a disposable temporary workspace, OpenHands proposed `file_editor.create`, waited for confirmation, and created one file; its first content contained a typo and its completion message falsely called it exact. A follow-up proposed `file_editor.str_replace`; after approval, disk readback confirmed exact `LOCAL_OPENHANDS_OK`. This demonstrates that the integration and approval path work, while local model output still needs review and independent verification.
+- Local RAM check now accounts for GPU-offloaded weights and the selected context rather than always requiring the full GGUF file size in system RAM. A unit test covers CPU versus full-GPU reserve and larger-context behavior. The actual preflight command through Tauri remains unverified; during the live 16K Vulkan+OpenHands run, available system RAM was about 2.3 GB, so this remains a low-memory device and CPU-only use of these large models needs substantially more headroom.
+- Verified 30 Rust tests, Clippy with warnings denied, `cargo fmt --check`, and `git diff --check`. The Tauri app window launched and responded, but native selection/click-to-start was not exercised. The GitHub runtime download/install command is covered by source tests and the manually verified asset, not yet by a clean-install smoke test.

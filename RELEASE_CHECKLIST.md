@@ -10,6 +10,12 @@
 - [ ] Verify release notes, known issues, artifact hashes, updater signature, manifest, APK signature and package metadata.
 - [ ] Confirm the release workflow has required signing secrets and GitHub write credentials.
 
+## Community update
+
+- [ ] Publish exactly one Reddit development post per public app version; record the version tag, post URL, and moderation status to prevent duplicates.
+- [ ] Include the verified changelog, current GitHub download link, and a screenshot captured from that version of the app. Clearly label prereleases and unverified platform builds.
+- [ ] If Reddit removes a post, record the filter/moderation result and wait for moderation guidance; do not evade it with duplicate posts.
+
 ## After publication
 
 - [ ] Confirm the GitHub tag and release point to the tested commit.

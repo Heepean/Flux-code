@@ -132,6 +132,80 @@ struct LlamaAsset {
     digest: Option<String>,
 }
 
+fn prism_windows_asset_suffix(backend: &str) -> &'static str {
+    match backend {
+        "vulkan" => "-bin-win-vulkan-x64.zip",
+        "hip" => "-bin-win-hip-radeon-x64.zip",
+        _ => "-bin-win-cpu-x64.zip",
+    }
+}
+
+fn select_llama_asset(releases: Vec<LlamaRelease>, suffix: &str) -> Option<(String, LlamaAsset)> {
+    releases.into_iter().find_map(|release| {
+        release
+            .assets
+            .into_iter()
+            .find(|asset| asset.name.starts_with("llama-") && asset.name.ends_with(suffix))
+            .map(|asset| (release.tag_name, asset))
+    })
+}
+
+#[cfg(windows)]
+fn is_amd_radeon_adapter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("amd") || name.contains("radeon")
+}
+
+#[cfg(windows)]
+fn adapter_display_names() -> Vec<String> {
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+
+    let mut names = Vec::new();
+    let mut index = 0;
+    loop {
+        let mut device = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        if unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut device, 0) } == 0 {
+            return names;
+        }
+        let name = String::from_utf16_lossy(
+            &device.DeviceString[..device
+                .DeviceString
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(device.DeviceString.len())],
+        );
+        names.push(name);
+        index += 1;
+    }
+}
+
+#[cfg(not(windows))]
+fn adapter_display_names() -> Vec<String> {
+    Vec::new()
+}
+
+fn llama_runtime_backend(
+    backend: &str,
+    prism_required: bool,
+    is_amd_radeon: bool,
+) -> Result<&'static str, String> {
+    match backend {
+        "cpu" => Ok("cpu"),
+        "vulkan" if prism_required && is_amd_radeon => Ok("hip"),
+        "vulkan" => Ok("vulkan"),
+        _ => Err("Выберите поддерживаемый backend: CPU или Vulkan".into()),
+    }
+}
+
+fn has_amd_radeon_adapter() -> bool {
+    adapter_display_names()
+        .iter()
+        .any(|name| is_amd_radeon_adapter(name))
+}
+
 #[derive(Serialize)]
 struct Entry {
     name: String,
@@ -434,14 +508,29 @@ fn path_is_file(path: String) -> bool {
 async fn install_llama_runtime(
     app: AppHandle,
     state: State<'_, Runtime>,
+    backend: String,
+    model_path: Option<String>,
 ) -> Result<String, String> {
     let _install_guard = state.llama_install_lock.lock().await;
+    if !matches!(backend.as_str(), "cpu" | "vulkan") {
+        return Err("Выберите поддерживаемый backend: CPU или Vulkan".into());
+    }
+    let prism_required = model_path.as_deref().is_some_and(|path| {
+        matches!(
+            Path::new(path).extension().and_then(|ext| ext.to_str()),
+            Some("gguf")
+        ) && (path.to_ascii_lowercase().contains("pq2_0")
+            || path.to_ascii_lowercase().contains("ptq1_0"))
+    });
+    let source = if prism_required { "prism" } else { "llama.cpp" };
+    let backend_name = llama_runtime_backend(&backend, prism_required, has_amd_radeon_adapter())?;
     let app_data = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    let runtime_root = app_data.join("runtimes").join("llama.cpp");
-    let executable = runtime_root.join("active").join("llama-server.exe");
+    let runtime_root = app_data.join("runtimes").join(source);
+    let runtime_dir = runtime_root.join(backend_name);
+    let executable = runtime_dir.join("llama-server.exe");
     if executable.is_file() {
         return Ok(executable.to_string_lossy().into_owned());
     }
@@ -452,59 +541,79 @@ async fn install_llama_runtime(
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|error| error.to_string())?;
+    let (releases_url, release_label) = if prism_required {
+        (
+            "https://api.github.com/repos/PrismML-Eng/llama.cpp/releases?per_page=30",
+            "PrismML",
+        )
+    } else {
+        (
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30",
+            "llama.cpp",
+        )
+    };
     let releases: Vec<LlamaRelease> = client
-        .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30")
+        .get(releases_url)
         .send()
         .await
-        .map_err(|error| format!("Не удалось проверить релизы llama.cpp: {error}"))?
+        .map_err(|error| format!("Не удалось проверить релизы {release_label}: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("GitHub отклонил запрос релизов llama.cpp: {error}"))?
+        .map_err(|error| format!("GitHub отклонил запрос релизов {release_label}: {error}"))?
         .json()
         .await
-        .map_err(|error| format!("Некорректный список релизов llama.cpp: {error}"))?;
-    let (release_tag, asset) = releases
-        .into_iter()
-        .find_map(|release| {
-            release
-                .assets
-                .into_iter()
-                .find(|asset| {
-                    asset.name.starts_with("llama-") && asset.name.ends_with("-bin-win-cpu-x64.zip")
-                })
-                .map(|asset| (release.tag_name, asset))
-        })
-        .ok_or_else(|| "В последних релизах llama.cpp нет сборки Windows x64 CPU".to_string())?;
+        .map_err(|error| format!("Некорректный список релизов {release_label}: {error}"))?;
+    let backend_asset = if prism_required {
+        prism_windows_asset_suffix(backend_name)
+    } else if backend_name == "vulkan" {
+        "-bin-win-vulkan-x64.zip"
+    } else {
+        "-bin-win-cpu-x64.zip"
+    };
+    // llama.cpp publishes its rolling Windows builds as prereleases, so
+    // filtering those out leaves clean installs with no runtime at all.
+    // We select the newest release that contains the requested signed
+    // digest asset and verify that digest before extraction.
+    let (release_tag, asset) = select_llama_asset(releases, backend_asset).ok_or_else(|| {
+        format!("В последних релизах {release_label} нет сборки Windows x64 {backend_name}")
+    })?;
     let expected_digest = asset
         .digest
         .as_deref()
         .and_then(|digest| digest.strip_prefix("sha256:"))
         .ok_or_else(|| {
-            "GitHub не предоставил SHA-256 для архива llama.cpp; загрузка отменена".to_string()
+            format!("GitHub не предоставил SHA-256 для {release_label}; загрузка отменена")
         })?;
     let response = client
         .get(asset.browser_download_url)
         .send()
         .await
-        .map_err(|error| format!("Не удалось скачать llama.cpp: {error}"))?
+        .map_err(|error| format!("Не удалось скачать {release_label}: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("Скачивание llama.cpp завершилось ошибкой: {error}"))?;
+        .map_err(|error| format!("Скачивание {release_label} завершилось ошибкой: {error}"))?;
     if response.content_length().unwrap_or_default() > 512 * 1024 * 1024 {
         return Err("Архив llama.cpp превышает безопасный предел 512 MB".into());
     }
     let bytes = response
         .bytes()
         .await
-        .map_err(|error| format!("Не удалось прочитать архив llama.cpp: {error}"))?;
+        .map_err(|error| format!("Не удалось прочитать архив {release_label}: {error}"))?;
     if bytes.len() < 1_000_000 || bytes.len() > 512 * 1024 * 1024 {
-        return Err("Архив llama.cpp имеет недопустимый размер; загрузка отменена".into());
+        return Err(format!(
+            "Архив {release_label} имеет недопустимый размер; загрузка отменена"
+        ));
     }
     let actual_digest = format!("{:x}", sha2::Sha256::digest(&bytes));
     if !actual_digest.eq_ignore_ascii_case(expected_digest) {
-        return Err("SHA-256 архива llama.cpp не совпадает с контрольной суммой GitHub".into());
+        return Err(format!(
+            "SHA-256 архива {release_label} не совпадает с контрольной суммой GitHub"
+        ));
     }
 
     fs::create_dir_all(&runtime_root).map_err(|error| error.to_string())?;
-    let staging = runtime_root.join(format!("installing-{}", uuid::Uuid::new_v4()));
+    let staging = runtime_root.join(format!(
+        "installing-{backend_name}-{}",
+        uuid::Uuid::new_v4()
+    ));
     fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
     let result = (|| -> Result<PathBuf, String> {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
@@ -543,14 +652,13 @@ async fn install_llama_runtime(
             return Err("Официальный архив не содержит llama-server.exe".into());
         }
         fs::write(staging.join("VERSION"), &release_tag).map_err(|error| error.to_string())?;
-        let active = runtime_root.join("active");
-        if active.exists() {
-            fs::remove_dir_all(&active).map_err(|error| {
-                format!("Не удалось заменить повреждённую llama.cpp сборку: {error}")
+        if runtime_dir.exists() {
+            fs::remove_dir_all(&runtime_dir).map_err(|error| {
+                format!("Не удалось заменить повреждённую сборку {release_label}: {error}")
             })?;
         }
-        fs::rename(&staging, &active).map_err(|error| error.to_string())?;
-        Ok(active.join("llama-server.exe"))
+        fs::rename(&staging, &runtime_dir).map_err(|error| error.to_string())?;
+        Ok(runtime_dir.join("llama-server.exe"))
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
@@ -580,7 +688,7 @@ fn scan_models(workspace: State<'_, WorkspaceState>) -> Result<Vec<Entry>, Strin
             });
         }
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|entry| entry.name.to_lowercase());
     Ok(out)
 }
 #[tauri::command]
@@ -899,11 +1007,27 @@ fn write_text_file(
     workspace: State<'_, WorkspaceState>,
     path: String,
     content: String,
+    expected_content: String,
 ) -> Result<(), String> {
     let root = workspace.active_root()?;
     let path = checked_workspace_path(&root, &path)?;
     if !path.is_file() {
         return Err("Можно сохранять только существующие файлы проекта".into());
+    }
+    write_text_file_if_unchanged(&path, &content, &expected_content)
+}
+
+fn write_text_file_if_unchanged(
+    path: &Path,
+    content: &str,
+    expected_content: &str,
+) -> Result<(), String> {
+    let current = std::fs::read_to_string(path)
+        .map_err(|error| format!("Не удалось проверить текущий файл перед сохранением: {error}"))?;
+    if current != expected_content {
+        return Err(
+            "Файл изменился на диске после открытия. Черновик сохранён в редакторе; перезагрузите файл или сравните изменения перед повторным сохранением.".into(),
+        );
     }
     std::fs::write(path, content).map_err(|e| e.to_string())
 }
@@ -965,25 +1089,12 @@ fn start_local_model(config: StartModel, state: State<Runtime>) -> Result<String
     if !config.model_path.to_ascii_lowercase().ends_with(".gguf") {
         return Err("Поддерживаются только файлы модели GGUF".into());
     }
-    #[cfg(windows)]
-    {
-        let model_bytes = fs::metadata(&config.model_path)
-            .map_err(|error| format!("Не удалось проверить размер модели: {error}"))?
-            .len();
-        let required_bytes = model_bytes.saturating_add(2 * 1024 * 1024 * 1024);
-        let available_bytes = available_physical_memory()?;
-        if available_bytes < required_bytes {
-            return Err(format!(
-                "Недостаточно свободной RAM для безопасного запуска модели. Модель занимает около {:.1} ГБ; требуется примерно {:.1} ГБ свободной RAM, сейчас доступно {:.1} ГБ. Закройте другие программы или выберите меньшую модель.",
-                model_bytes as f64 / 1024f64.powi(3),
-                required_bytes as f64 / 1024f64.powi(3),
-                available_bytes as f64 / 1024f64.powi(3)
-            ));
-        }
-    }
     let context = config.context.unwrap_or(4096);
-    if !(512..=131072).contains(&context) {
-        return Err("Размер контекста должен быть от 512 до 131072 токенов".into());
+    if !(16384..=131072).contains(&context) {
+        return Err(
+            "Для OpenHands Agent Server нужен контекст не меньше 16384 токенов; максимум — 131072"
+                .into(),
+        );
     }
     let gpu_layers = config.gpu_layers.unwrap_or(0);
     if !(-1..=999).contains(&gpu_layers) {
@@ -991,9 +1102,11 @@ fn start_local_model(config: StartModel, state: State<Runtime>) -> Result<String
     }
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
     let mut active = state.child.lock().map_err(|e| e.to_string())?;
-    if let Some(mut child) = active.take() {
-        terminate_process_tree(&mut child)?;
-    }
+    // Release the previous model before checking RAM. Otherwise its weights
+    // remain resident and can make a valid model switch look impossible.
+    switch_local_model(&mut active, |_| {
+        ensure_model_memory(&config.model_path, gpu_layers, context)
+    })?;
     let mut cmd = Command::new(&config.executable);
     cmd.args([
         "--model",
@@ -1055,11 +1168,64 @@ fn start_local_model(config: StartModel, state: State<Runtime>) -> Result<String
 
 #[tauri::command]
 fn stop_local_model(state: State<Runtime>) -> Result<(), String> {
+    stop_local_model_process(&state)
+}
+
+fn stop_local_model_process(state: &Runtime) -> Result<(), String> {
     state.generation.fetch_add(1, Ordering::SeqCst);
     let mut active = state.child.lock().map_err(|e| e.to_string())?;
+    stop_active_model(&mut active)
+}
+
+fn stop_active_model(active: &mut Option<Child>) -> Result<(), String> {
     if let Some(mut child) = active.take() {
         terminate_process_tree(&mut child)?;
     }
+    Ok(())
+}
+
+fn switch_local_model<T>(
+    active: &mut Option<Child>,
+    check_after_stop: impl FnOnce(&Option<Child>) -> Result<T, String>,
+) -> Result<T, String> {
+    stop_active_model(active)?;
+    check_after_stop(active)
+}
+
+fn required_system_memory(model_bytes: u64, gpu_layers: i32, context: u32) -> u64 {
+    // Full GPU offload keeps most quantized weights in VRAM. Retain headroom
+    // for the runtime, context/KV cache, and Windows instead of counting the
+    // whole GGUF as resident system RAM.
+    let resident_weights = if gpu_layers == -1 {
+        (model_bytes / 10).max(512 * 1024 * 1024)
+    } else {
+        model_bytes
+    };
+    let context_reserve = u64::from(context).saturating_mul(256 * 1024);
+    resident_weights
+        .saturating_add(context_reserve)
+        .saturating_add(768 * 1024 * 1024)
+}
+
+#[cfg(windows)]
+fn ensure_model_memory(model_path: &str, gpu_layers: i32, context: u32) -> Result<(), String> {
+    let model_bytes = fs::metadata(model_path)
+        .map_err(|error| format!("Не удалось проверить размер модели: {error}"))?
+        .len();
+    let required_bytes = required_system_memory(model_bytes, gpu_layers, context);
+    let available_bytes = available_physical_memory()?;
+    if available_bytes < required_bytes {
+        return Err(format!(
+            "Недостаточно свободной RAM для выбранных настроек локальной модели. Резерв для весов/runtime/контекста: около {:.1} ГБ; свободно {:.1} ГБ. Закройте другие программы, уменьшите контекст или число слоёв на GPU.",
+            required_bytes as f64 / 1024f64.powi(3),
+            available_bytes as f64 / 1024f64.powi(3)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn ensure_model_memory(_model_path: &str, _gpu_layers: i32, _context: u32) -> Result<(), String> {
     Ok(())
 }
 
@@ -1286,6 +1452,7 @@ pub fn run() {
         })
         .manage(WorkspaceState::default())
         .manage(openhands::AgentServerState::default())
+        .manage(openhands::DirectModelState::default())
         .invoke_handler(tauri::generate_handler![
             list_directory,
             browse_directory,
@@ -1316,6 +1483,8 @@ pub fn run() {
             openhands::stop_agent_server,
             openhands::get_agent_server_status,
             openhands::send_agent_message,
+            openhands::send_direct_model_message,
+            openhands::cancel_direct_model_message,
             openhands::interrupt_agent_conversation,
             openhands::respond_to_agent_confirmation,
             openhands::save_model_provider_key,
@@ -1349,9 +1518,11 @@ pub fn run() {
 mod workspace_search_tests {
     use super::{
         checked_workspace_path, create_project_path, git_file_diff_for, git_status_for,
-        ignored_search_directory, matching_lines, rollback_agent_file_change_for,
-        search_workspace_files, terminate_process_tree, validate_search_query, AgentFileRollback,
-        StartModel, WorkspaceState,
+        has_amd_radeon_adapter, ignored_search_directory, is_amd_radeon_adapter,
+        llama_runtime_backend, matching_lines, prism_windows_asset_suffix, required_system_memory,
+        rollback_agent_file_change_for, search_workspace_files, select_llama_asset,
+        switch_local_model, terminate_process_tree, validate_search_query,
+        write_text_file_if_unchanged, AgentFileRollback, LlamaRelease, StartModel, WorkspaceState,
     };
     use std::fs;
     use std::process::{Command, Stdio};
@@ -1371,6 +1542,123 @@ mod workspace_search_tests {
         assert_eq!(config.executable, "C:/runtime/llama-server.exe");
         assert_eq!(config.context, Some(1024));
         assert_eq!(config.gpu_layers, Some(0));
+    }
+
+    #[test]
+    fn editor_save_refuses_to_overwrite_external_changes() {
+        let root =
+            std::env::temp_dir().join(format!("flux-editor-conflict-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.txt");
+        std::fs::write(&path, "external version").unwrap();
+
+        let result = write_text_file_if_unchanged(&path, "editor draft", "opened version");
+
+        assert!(result.unwrap_err().contains("Файл изменился на диске"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external version");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_save_writes_when_disk_matches_opened_version() {
+        let root = std::env::temp_dir().join(format!("flux-editor-save-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.txt");
+        std::fs::write(&path, "opened version").unwrap();
+
+        write_text_file_if_unchanged(&path, "editor draft", "opened version").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "editor draft");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prism_backend_selects_radeon_hip_and_supported_windows_asset() {
+        assert_eq!(llama_runtime_backend("cpu", true, true).unwrap(), "cpu");
+        assert_eq!(llama_runtime_backend("vulkan", true, true).unwrap(), "hip");
+        assert_eq!(
+            llama_runtime_backend("vulkan", true, false).unwrap(),
+            "vulkan"
+        );
+        assert_eq!(
+            prism_windows_asset_suffix("hip"),
+            "-bin-win-hip-radeon-x64.zip"
+        );
+        assert_eq!(
+            prism_windows_asset_suffix("vulkan"),
+            "-bin-win-vulkan-x64.zip"
+        );
+        assert!(is_amd_radeon_adapter("AMD Radeon RX 7700 XT"));
+        assert!(is_amd_radeon_adapter("Radeon(TM) Graphics"));
+        assert!(!is_amd_radeon_adapter("NVIDIA GeForce RTX 4080"));
+    }
+
+    #[test]
+    fn gpu_offload_memory_preflight_reserves_context_without_counting_full_model_in_ram() {
+        let model_bytes = 6_725_900_288;
+        let cpu_required = required_system_memory(model_bytes, 0, 16_384);
+        let gpu_required = required_system_memory(model_bytes, -1, 16_384);
+        assert!(cpu_required > model_bytes);
+        assert!(gpu_required < model_bytes);
+        assert!(gpu_required > 5 * 1024 * 1024 * 1024);
+        assert!(gpu_required < 6 * 1024 * 1024 * 1024);
+        assert!(required_system_memory(model_bytes, -1, 32_768) > gpu_required);
+    }
+
+    #[test]
+    fn runtime_installer_selects_signed_rolling_prerelease_assets() {
+        let releases: Vec<LlamaRelease> = serde_json::from_value(serde_json::json!([
+            {
+                "tag_name": "b11565",
+                "prerelease": true,
+                "assets": [{
+                    "name": "llama-b11565-bin-win-vulkan-x64.zip",
+                    "browser_download_url": "https://example.invalid/llama.zip",
+                    "digest": "sha256:abc"
+                }]
+            }
+        ]))
+        .unwrap();
+        let (tag, asset) = select_llama_asset(releases, "-bin-win-vulkan-x64.zip").unwrap();
+        assert_eq!(tag, "b11565");
+        assert_eq!(asset.digest.as_deref(), Some("sha256:abc"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detected_machine_selects_a_real_prism_backend() {
+        let selected = llama_runtime_backend("vulkan", true, has_amd_radeon_adapter()).unwrap();
+        assert_eq!(selected, "hip");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_model_switch_stops_previous_server_before_resource_preflight() {
+        use std::os::windows::process::CommandExt;
+
+        let child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "while ($true) { Start-Sleep -Seconds 1 }",
+            ])
+            .creation_flags(0x08000000)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut active = Some(child);
+
+        switch_local_model(&mut active, |previous| {
+            assert!(
+                previous.is_none(),
+                "previous server must stop before preflight"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(active.is_none());
     }
 
     #[test]

@@ -3,19 +3,33 @@ use std::io::{Cursor, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{terminate_process_tree, WorkspaceState};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 const SERVER_VERSION: &str = "1.26.0";
 const KILO_GATEWAY_BASE: &str = "https://api.kilo.ai/api/gateway";
 const UV_RELEASE_API: &str = "https://api.github.com/repos/astral-sh/uv/releases/latest";
+const UV_RELEASE_DOWNLOAD: &str = "https://github.com/astral-sh/uv/releases/download";
 const UV_WINDOWS_ARCHIVE: &str = "uv-x86_64-pc-windows-msvc.zip";
+
+#[derive(Default)]
+pub struct DirectModelState {
+    generation: Arc<AtomicU64>,
+}
 type AgentConfig = (String, String, String, String, String);
+
+#[derive(Deserialize)]
+pub struct DirectChatMessage {
+    role: String,
+    content: String,
+}
 
 #[derive(Default)]
 pub struct AgentServerState {
@@ -78,6 +92,7 @@ struct AgentFileChange {
 
 #[derive(Deserialize)]
 struct UvRelease {
+    tag_name: String,
     assets: Vec<UvAsset>,
 }
 
@@ -85,6 +100,7 @@ struct UvRelease {
 struct UvAsset {
     name: String,
     browser_download_url: String,
+    digest: Option<String>,
 }
 
 fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -145,36 +161,187 @@ async fn install_uvx(app: &AppHandle) -> Result<PathBuf, String> {
         .into_iter()
         .find(|asset| asset.name == UV_WINDOWS_ARCHIVE)
         .ok_or_else(|| "В последнем релизе uv нет архива для Windows x64".to_string())?;
-    let bytes = client
+    let archive_response = client
         .get(asset.browser_download_url)
         .send()
         .await
         .map_err(|error| format!("Не удалось скачать runtime uv: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("Скачивание uv завершилось ошибкой: {error}"))?
+        .map_err(|error| format!("Скачивание uv завершилось ошибкой: {error}"))?;
+    if archive_response
+        .content_length()
+        .is_some_and(|length| length > 128 * 1024 * 1024)
+    {
+        return Err("Архив uv превышает безопасный предел 128 MB".into());
+    }
+    let bytes = archive_response
         .bytes()
         .await
         .map_err(|error| error.to_string())?;
+    if bytes.is_empty() || bytes.len() > 128 * 1024 * 1024 {
+        return Err("Архив uv имеет недопустимый размер; установка отменена".into());
+    }
+    let expected_digest =
+        if let Some(digest) = asset.digest.as_deref().and_then(parse_sha256_digest) {
+            digest
+        } else {
+            let checksum_url = format!(
+                "{UV_RELEASE_DOWNLOAD}/{}/{}.sha256",
+                release.tag_name, UV_WINDOWS_ARCHIVE
+            );
+            let checksum = client
+                .get(checksum_url)
+                .send()
+                .await
+                .map_err(|error| format!("Не удалось проверить checksum runtime uv: {error}"))?
+                .error_for_status()
+                .map_err(|error| format!("Источник checksum uv отклонил запрос: {error}"))?
+                .text()
+                .await
+                .map_err(|error| format!("Не удалось прочитать checksum runtime uv: {error}"))?;
+            checksum
+                .split_whitespace()
+                .next()
+                .and_then(parse_sha256_digest)
+                .ok_or_else(|| "Источник uv не вернул SHA-256 checksum".to_string())?
+        };
+    let actual_digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    if !actual_digest.eq_ignore_ascii_case(&expected_digest) {
+        return Err(
+            "SHA-256 архива uv не совпадает с официальной checksum; установка отменена".into(),
+        );
+    }
+
     let directory = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join("bin");
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let mut archive =
-        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
-    for name in ["uv.exe", "uvx.exe"] {
-        let entry_name = format!("uv-x86_64-pc-windows-msvc/{name}");
-        let mut entry = archive
-            .by_name(&entry_name)
-            .map_err(|error| format!("Архив uv не содержит {name}: {error}"))?;
-        let target = directory.join(name);
-        let temporary = directory.join(format!("{name}.installing"));
-        let mut output = fs::File::create(&temporary).map_err(|error| error.to_string())?;
-        std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
-        fs::rename(temporary, target).map_err(|error| error.to_string())?;
+    let staging = directory.join(format!("uv-installing-{}", Uuid::new_v4()));
+    fs::create_dir(&staging).map_err(|error| error.to_string())?;
+    let result = (|| -> Result<(), String> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|error| format!("Не удалось открыть проверенный архив uv: {error}"))?;
+        for name in ["uv.exe", "uvx.exe"] {
+            let entry_index = find_uv_executable_index(&mut archive, name)
+                .ok_or_else(|| format!("Архив uv не содержит {name}"))?;
+            let mut entry = archive
+                .by_index(entry_index)
+                .map_err(|error| format!("Не удалось прочитать {name} из архива uv: {error}"))?;
+            if entry.size() == 0 || entry.size() > 64 * 1024 * 1024 {
+                return Err(format!("Файл {name} в архиве uv имеет недопустимый размер"));
+            }
+            let mut output =
+                fs::File::create(staging.join(name)).map_err(|error| error.to_string())?;
+            std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+            output.sync_all().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
     }
+    if let Err(error) = activate_uv_binaries(&directory, &staging, ["uv.exe", "uvx.exe"]) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("Не удалось активировать runtime uv: {error}"));
+    }
+    fs::remove_dir(&staging).map_err(|error| error.to_string())?;
     Ok(directory.join("uvx.exe"))
+}
+
+fn agent_server_runtime_args() -> Vec<String> {
+    let mut args = vec![
+        "--from".into(),
+        format!("openhands-agent-server=={SERVER_VERSION}"),
+    ];
+    let requirements = [
+        format!("openhands-sdk=={SERVER_VERSION}"),
+        format!("openhands-tools=={SERVER_VERSION}"),
+        format!("openhands-workspace=={SERVER_VERSION}"),
+        // OpenHands 1.26 allows FastMCP 4, which selects MCP 2.x. The
+        // bundled browser-use MCP server still uses the MCP 1.x decorator API.
+        "fastmcp>=3,<4".to_string(),
+        "mcp<2".to_string(),
+        "posthog>=6,<7".to_string(),
+    ];
+    for requirement in requirements {
+        args.extend(["--with".into(), requirement]);
+    }
+    args.extend(
+        ["agent-server", "--host", "127.0.0.1", "--port"]
+            .into_iter()
+            .map(str::to_string),
+    );
+    args
+}
+
+fn activate_uv_binaries<const N: usize>(
+    directory: &Path,
+    staging: &Path,
+    names: [&str; N],
+) -> Result<(), String> {
+    let backups = names.map(|name| directory.join(format!("{name}.previous")));
+    let targets = names.map(|name| directory.join(name));
+    let sources = names.map(|name| staging.join(name));
+    let mut backed_up = 0;
+    let mut activated = 0;
+
+    let activation = (|| -> Result<(), String> {
+        for (target, backup) in targets.iter().zip(&backups) {
+            if target.exists() {
+                if backup.exists() {
+                    fs::remove_file(backup).map_err(|error| error.to_string())?;
+                }
+                fs::rename(target, backup).map_err(|error| error.to_string())?;
+            }
+            backed_up += 1;
+        }
+        for (source, target) in sources.iter().zip(&targets) {
+            fs::rename(source, target).map_err(|error| error.to_string())?;
+            activated += 1;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = activation {
+        for target in targets.iter().take(activated) {
+            let _ = fs::remove_file(target);
+        }
+        for (target, backup) in targets.iter().zip(&backups).take(backed_up) {
+            if backup.exists() {
+                let _ = fs::rename(backup, target);
+            }
+        }
+        return Err(error);
+    }
+
+    for backup in backups {
+        if backup.exists() {
+            fs::remove_file(backup).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_sha256_digest(value: &str) -> Option<String> {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| digest.to_ascii_lowercase())
+}
+
+fn find_uv_executable_index<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Option<usize> {
+    (0..archive.len()).find(|index| {
+        archive
+            .by_index(*index)
+            .ok()
+            .map(|entry| entry.name().replace('\\', "/").rsplit('/').next() == Some(name))
+            .unwrap_or(false)
+    })
 }
 
 fn free_port() -> Result<u16, String> {
@@ -344,6 +511,154 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
     }
     parsed.set_path(&path);
     Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn completion_text(value: &serde_json::Value) -> Result<String, String> {
+    let content = value
+        .pointer("/choices/0/message/content")
+        .ok_or("Модель вернула ответ без текста")?;
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_owned());
+    }
+    if let Some(parts) = content.as_array() {
+        let text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect::<String>();
+        if !text.is_empty() {
+            return Ok(text);
+        }
+    }
+    Err("Модель вернула ответ без поддерживаемого текстового содержимого".into())
+}
+
+#[tauri::command]
+pub async fn send_direct_model_message(
+    state: State<'_, DirectModelState>,
+    provider: String,
+    model: String,
+    endpoint: String,
+    api_key: Option<String>,
+    messages: Vec<DirectChatMessage>,
+) -> Result<String, String> {
+    let provider = provider.trim().to_ascii_lowercase();
+    if provider != "remote" && provider != "kilo" {
+        return Err("Прямой запрос поддерживает только удалённые модели".into());
+    }
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("Выберите модель перед отправкой".into());
+    }
+    if messages.is_empty() || messages.len() > 40 {
+        return Err("В чате должно быть от 1 до 40 сообщений".into());
+    }
+    let mut total_chars = 0usize;
+    let mut request_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        if message.role != "user" && message.role != "assistant" {
+            return Err("История чата содержит неизвестную роль сообщения".into());
+        }
+        total_chars = total_chars.saturating_add(message.content.chars().count());
+        if total_chars > 64_000 {
+            return Err("История чата превышает лимит 64000 символов".into());
+        }
+        request_messages
+            .push(serde_json::json!({"role": message.role, "content": message.content}));
+    }
+    let (base, api_key) = if provider == "kilo" {
+        (KILO_GATEWAY_BASE.to_string(), String::new())
+    } else {
+        let base = normalize_endpoint(&endpoint)?;
+        #[cfg(target_os = "android")]
+        let api_key = api_key.unwrap_or_default().trim().to_owned();
+        #[cfg(not(target_os = "android"))]
+        let api_key = api_key
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                remote_key_entry()
+                    .ok()
+                    .and_then(|entry| entry.get_password().ok())
+            })
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let is_loopback = reqwest::Url::parse(&base)
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1")
+            })
+            .unwrap_or(false);
+        if api_key.is_empty() && !is_loopback {
+            return Err("Введите API-ключ этой модели в настройках".into());
+        }
+        (base, api_key)
+    };
+    send_openai_compatible_chat(
+        Arc::clone(&state.generation),
+        base,
+        model,
+        request_messages,
+        api_key,
+    )
+    .await
+}
+
+async fn send_openai_compatible_chat(
+    generation_state: Arc<AtomicU64>,
+    base: String,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    api_key: String,
+) -> Result<String, String> {
+    let generation = generation_state.fetch_add(1, Ordering::SeqCst) + 1;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut request = client
+        .post(format!("{base}/chat/completions"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": false
+        }));
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = tokio::select! {
+        response = request.send() => response
+            .map_err(|error| format!("Не удалось подключиться к модели: {error}"))?,
+        _ = wait_for_direct_request_cancel(&generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
+    };
+    let status = response.status();
+    let body = tokio::select! {
+        body = response.bytes() => body
+            .map_err(|error| format!("Не удалось прочитать ответ модели: {error}"))?,
+        _ = wait_for_direct_request_cancel(&generation_state, generation) => return Err("Запрос удалённой модели остановлен".into()),
+    };
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&body);
+        return Err(format!("Провайдер вернул HTTP {status}: {detail}"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("Провайдер вернул некорректный JSON: {error}"))?;
+    completion_text(&value)
+}
+
+async fn wait_for_direct_request_cancel(generation_state: &AtomicU64, generation: u64) {
+    loop {
+        if generation_state.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tauri::command]
+pub fn cancel_direct_model_message(state: State<'_, DirectModelState>) {
+    state.generation.fetch_add(1, Ordering::SeqCst);
 }
 
 fn kilo_model_is_free_text(model: &serde_json::Value) -> bool {
@@ -524,22 +839,7 @@ pub async fn start_agent_server(
     let directory = data_dir(&app)?;
     let mut command = Command::new(executable);
     command
-        .args([
-            "--from",
-            "openhands-agent-server==1.26.0",
-            "--with",
-            "openhands-sdk==1.26.0",
-            "--with",
-            "openhands-tools==1.26.0",
-            "--with",
-            "openhands-workspace==1.26.0",
-            "--with",
-            "posthog>=6,<7",
-            "agent-server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-        ])
+        .args(agent_server_runtime_args())
         .arg(port.to_string())
         .current_dir(&workspace)
         .env("OH_CONVERSATION_RUNTIME", "local")
@@ -814,7 +1114,7 @@ pub async fn send_agent_message(
         .lock()
         .map_err(|error| error.to_string())?
         .is_none();
-    if server_is_local && PathBuf::from(&workspace) != workspace_state.active_root()? {
+    if server_is_local && Path::new(&workspace) != workspace_state.active_root()?.as_path() {
         return Err(
             "Проект OpenHands изменился. Перезапустите Agent Server для текущей папки".into(),
         );
@@ -1307,6 +1607,15 @@ pub async fn respond_to_agent_confirmation(
         };
         (base, key)
     };
+    respond_to_confirmation(&base, &key, conversation_id, accept).await
+}
+
+async fn respond_to_confirmation(
+    base: &str,
+    key: &str,
+    conversation_id: Uuid,
+    accept: bool,
+) -> Result<(), String> {
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -1399,13 +1708,30 @@ async fn ensure_success_json(
     ))
 }
 
+pub fn stop_on_exit(app: &AppHandle) {
+    let state = app.state::<AgentServerState>();
+    if let Ok(mut child) = state.child.lock() {
+        if let Some(mut child) = child.take() {
+            let _ = terminate_process_tree(&mut child);
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_connection, interrupt_conversation, kilo_model_is_free_text,
-        reuse_or_stop_existing_agent, status, AgentConfig, AgentServerState,
+        activate_uv_binaries, agent_connection, agent_server_runtime_args, completion_text,
+        find_uv_executable_index, interrupt_conversation, kilo_model_is_free_text,
+        parse_sha256_digest, respond_to_confirmation, reuse_or_stop_existing_agent, status,
+        AgentConfig, AgentServerState, UV_WINDOWS_ARCHIVE,
     };
+    use std::fs;
+    use std::io::Cursor;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use uuid::Uuid;
 
     #[test]
     fn interrupt_uses_the_openhands_route_and_session_key() {
@@ -1445,6 +1771,202 @@ mod tests {
     }
 
     #[test]
+    fn approval_uses_the_confirmation_route_session_key_and_accept_flag() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        tauri::async_runtime::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(request.starts_with(&format!(
+                    "POST /api/conversations/{}/events/respond_to_confirmation HTTP/1.1",
+                    uuid::Uuid::nil()
+                )));
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("x-session-api-key: test-session"));
+                let body = request.split("\r\n\r\n").nth(1).unwrap();
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(body["accept"], true);
+                assert_eq!(body["reason"], "Approved in Flux Hands.");
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            });
+
+            respond_to_confirmation(
+                &format!("http://{address}"),
+                "test-session",
+                uuid::Uuid::nil(),
+                true,
+            )
+            .await
+            .unwrap();
+            server.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn uv_sha256_parser_accepts_api_and_sidecar_formats() {
+        let digest = "088962f9e7b7bd9ea740c04c650b2a21c8928c345bd99ac24350dc924dba656c";
+        assert_eq!(
+            parse_sha256_digest(&format!("sha256:{digest}")),
+            Some(digest.into())
+        );
+        assert_eq!(
+            parse_sha256_digest(&format!("{digest}  {UV_WINDOWS_ARCHIVE}")),
+            None
+        );
+        assert_eq!(parse_sha256_digest(digest), Some(digest.into()));
+        assert_eq!(parse_sha256_digest("sha256:abcd"), None);
+        assert_eq!(parse_sha256_digest(&"g".repeat(64)), None);
+    }
+
+    #[test]
+    fn uv_sidecar_checksum_ignores_filename_after_digest() {
+        let digest = "088962f9e7b7bd9ea740c04c650b2a21c8928c345bd99ac24350dc924dba656c";
+        let sidecar = format!("{digest}  {UV_WINDOWS_ARCHIVE}\n");
+        assert_eq!(
+            parse_sha256_digest(sidecar.split_whitespace().next().unwrap()),
+            Some(digest.into())
+        );
+    }
+
+    #[test]
+    fn uv_archive_lookup_supports_flat_and_nested_executable_paths() {
+        use std::io::Write;
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut bytes);
+            for path in ["uv.exe", "uvw.exe", "uv-x86_64-pc-windows-msvc/uvx.exe"] {
+                writer
+                    .start_file(path, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(b"binary").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        bytes.set_position(0);
+        let mut archive = zip::ZipArchive::new(bytes).unwrap();
+        assert_eq!(find_uv_executable_index(&mut archive, "uv.exe"), Some(0));
+        assert_eq!(find_uv_executable_index(&mut archive, "uvx.exe"), Some(2));
+        assert_eq!(find_uv_executable_index(&mut archive, "python.exe"), None);
+    }
+
+    #[test]
+    fn direct_model_request_works_without_an_agent_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        tauri::async_runtime::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = vec![0; 16_384];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                assert_eq!(body["model"], "test-model");
+                assert_eq!(body["messages"][0]["content"], "Earlier question");
+                assert_eq!(body["messages"][1]["content"], "Current question");
+                let response = r#"{"choices":[{"message":{"content":"Direct response"}}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(), response
+                ).unwrap();
+            });
+            let answer = super::send_openai_compatible_chat(
+                Arc::new(AtomicU64::new(0)),
+                format!("http://{address}/v1"),
+                "test-model",
+                vec![
+                    serde_json::json!({"role":"user", "content":"Earlier question"}),
+                    serde_json::json!({"role":"user", "content":"Current question"}),
+                ],
+                String::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(answer, "Direct response");
+            server.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn direct_model_response_extracts_text_blocks() {
+        let response = serde_json::json!({"choices":[{"message":{"content":[
+            {"type":"text","text":"first "},
+            {"type":"text","text":"second"}
+        ]}}]});
+        assert_eq!(completion_text(&response).unwrap(), "first second");
+    }
+
+    #[test]
+    fn direct_model_request_can_be_cancelled() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::thread;
+
+        tauri::async_runtime::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let generation = Arc::new(AtomicU64::new(0));
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer);
+                thread::sleep(Duration::from_millis(500));
+            });
+            let request = tauri::async_runtime::spawn(super::send_openai_compatible_chat(
+                Arc::clone(&generation),
+                format!("http://{address}/v1"),
+                "test-model",
+                vec![serde_json::json!({"role":"user", "content":"Cancel this request"})],
+                String::new(),
+            ));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            generation.fetch_add(1, Ordering::SeqCst);
+            let result = tokio::time::timeout(Duration::from_secs(2), request)
+                .await
+                .expect("cancelled remote request should finish promptly")
+                .unwrap();
+            assert!(result.unwrap_err().contains("остановлен"));
+            server.join().unwrap();
+        });
+    }
+    #[test]
+    fn uv_binary_activation_restores_previous_pair_if_second_install_fails() {
+        let root = std::env::temp_dir().join(format!("flux-uv-activation-{}", Uuid::new_v4()));
+        let directory = root.join("bin");
+        let staging = root.join("staging");
+        fs::create_dir_all(&directory).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(directory.join("uv.exe"), b"old uv").unwrap();
+        fs::write(directory.join("uvx.exe"), b"old uvx").unwrap();
+        fs::write(staging.join("uv.exe"), b"new uv").unwrap();
+
+        let result = activate_uv_binaries(&directory, &staging, ["uv.exe", "uvx.exe"]);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(directory.join("uv.exe")).unwrap(), b"old uv");
+        assert_eq!(fs::read(directory.join("uvx.exe")).unwrap(), b"old uvx");
+        assert!(!directory.join("uv.exe.previous").exists());
+        assert!(!directory.join("uvx.exe.previous").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_connection_prefers_configured_remote_server() {
         let state = AgentServerState::default();
         *state.remote_base.lock().unwrap() = Some("http://agent.example".into());
@@ -1454,6 +1976,20 @@ mod tests {
             agent_connection(&state).unwrap(),
             ("http://agent.example".into(), "session".into())
         );
+    }
+
+    #[test]
+    fn agent_server_pins_browser_compatible_fastmcp_and_mcp_versions() {
+        let args = agent_server_runtime_args();
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair[0] == "--with" && pair[1] == "fastmcp>=3,<4" }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--with" && pair[1] == "mcp<2"));
+        assert!(args
+            .iter()
+            .any(|argument| argument == "openhands-agent-server==1.26.0"));
     }
 
     #[cfg(windows)]
@@ -1512,13 +2048,4 @@ mod tests {
         });
         assert!(kilo_model_is_free_text(&no_tools));
     }
-}
-
-pub fn stop_on_exit(app: &AppHandle) {
-    let state = app.state::<AgentServerState>();
-    if let Ok(mut child) = state.child.lock() {
-        if let Some(mut child) = child.take() {
-            let _ = terminate_process_tree(&mut child);
-        }
-    };
 }

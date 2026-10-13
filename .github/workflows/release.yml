@@ -161,6 +161,8 @@ jobs:
         run: npm ci
       - name: Initialize Android project
         run: npm run tauri -- android init --ci --skip-targets-install
+      - name: Generate application icons for all platforms
+        run: npm run tauri -- icon src-tauri/icons/icon-manifest.json -o src-tauri/icons
       - name: Build installable Android ARM64 test APK
         run: npm run tauri -- android build --debug --apk --target aarch64 --config src-tauri/tauri.android.conf.json
       - name: Prepare APK release asset
