@@ -22,7 +22,6 @@ if ($token) {
 }
 
 $base = "https://api.github.com/repos/$repository"
-$latest = Invoke-RestMethod -Method Get -Uri "$base/releases/latest" -Headers $headers
 $currentTag = $env:GITHUB_REF_NAME
 if ($currentTag -notmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
     Write-Host "Skipping release-asset cleanup for non-release ref '$currentTag'. Cleanup runs only after a versioned release is created."
@@ -32,6 +31,14 @@ $current = Invoke-RestMethod -Method Get -Uri "$base/releases/tags/$currentTag" 
 if ($current.draft) {
     throw "Refusing cleanup because current release '$currentTag' is still a draft."
 }
+$latest = $null
+try {
+    $latest = Invoke-RestMethod -Method Get -Uri "$base/releases/latest" -Headers $headers
+}
+catch {
+    if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+    Write-Host 'No stable release exists yet; retaining the current published prerelease.'
+}
 $releases = @()
 $page = 1
 do {
@@ -39,7 +46,8 @@ do {
     $releases += $batch
     $page++
 } while ($batch.Count -eq 100)
-$keepIds = @($latest.id, $current.id)
+$keepIds = @($current.id)
+if ($latest -and $latest.id) { $keepIds += $latest.id }
 $staleReleases = @($releases | Where-Object { $_.id -notin $keepIds })
 $removed = 0
 
@@ -58,4 +66,5 @@ foreach ($release in $staleReleases) {
     }
 }
 
-Write-Host "Kept current release $($current.tag_name) and latest stable release $($latest.tag_name); removed $removed installer/updater assets from older releases."
+$latestTag = if ($latest) { $latest.tag_name } else { 'none' }
+Write-Host "Kept current release $($current.tag_name) and latest stable release $latestTag; removed $removed installer/updater assets from older releases."

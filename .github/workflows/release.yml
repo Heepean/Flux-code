@@ -21,11 +21,12 @@ jobs:
         shell: bash
         run: |
           version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [[ "$GITHUB_REF_NAME" != "v${version}" && "$GITHUB_REF_NAME" != "v${version}-beta."* ]]; then
+          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
             echo "Tag $GITHUB_REF_NAME does not match version $version." >&2
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "notes_version=${version%%-beta.*}" >> "$GITHUB_OUTPUT"
       - id: draft
         uses: softprops/action-gh-release@v3
         with:
@@ -34,7 +35,7 @@ jobs:
           generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-beta.') }}
           draft: true
-          body_path: .github/release-notes/v${{ steps.version.outputs.value }}.md
+          body_path: .github/release-notes/v${{ steps.version.outputs.notes_version }}.md
   release:
     needs: prepare_release
     runs-on: windows-latest
@@ -59,7 +60,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Run Rust tests
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test -- --test-threads=1
       - name: Verify updater signing secrets
         shell: pwsh
         env:
@@ -83,7 +84,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           $version = [string]$config.version
-          if ($env:RELEASE_TAG -notmatch ('^v' + [regex]::Escape($version) + '(-beta\.\d+)?$')) { throw "Tag $($env:RELEASE_TAG) does not match version $version." }
+          if ($env:RELEASE_TAG -ne "v$version") { throw "Tag $($env:RELEASE_TAG) does not match version $version." }
           $source = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' | Select-Object -First 1
           if (-not $source) { throw 'NSIS installer was not generated.' }
           $sourceSig = "$($source.FullName).sig"
@@ -119,6 +120,7 @@ jobs:
           }
           "staging=release-assets" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
+          "notes_version=$($version -replace '-beta\.\d+$','')" >> $env:GITHUB_OUTPUT
       - id: upload_windows_assets
         uses: softprops/action-gh-release@v3
         with:
@@ -128,7 +130,7 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-beta.') }}
           draft: true
           overwrite_files: true
-          body_path: .github/release-notes/v${{ steps.assets.outputs.version }}.md
+          body_path: .github/release-notes/v${{ steps.assets.outputs.notes_version }}.md
           files: release-assets/*
           fail_on_unmatched_files: true
   android:
@@ -212,7 +214,7 @@ jobs:
           $base = "https://api.github.com/repos/$env:REPOSITORY"
           if (-not $env:RELEASE_ID) { throw 'The draft release action did not return a release ID.' }
           if (-not $env:WINDOWS_ASSETS -or -not $env:ANDROID_ASSETS) { throw 'A platform release action did not return uploaded asset metadata.' }
-          $version = $env:RELEASE_TAG -replace '^v', '' -replace '-beta\.\d+$', ''
+          $version = $env:RELEASE_TAG -replace '^v', ''
           $expected = @(
             "Flux.Hands_${version}_x64-setup.exe",
             "Flux.Hands_${version}_x64-setup.exe.sig",
@@ -245,6 +247,22 @@ jobs:
             if ($asset.size -le 0) { throw "Published release contains an empty asset: $($asset.name)" }
           }
           Write-Host "Published $env:RELEASE_TAG after verifying $($verifiedAssets.Count) Windows and Android assets."
+          $manifestAsset = $publishedAssets | Where-Object { $_.name -eq 'latest.json' } | Select-Object -First 1
+          if (-not $manifestAsset) { throw 'The published release has no signed updater manifest.' }
+          $manifestPath = Join-Path $env:RUNNER_TEMP 'latest.json'
+          Invoke-WebRequest -Uri $manifestAsset.browser_download_url -OutFile $manifestPath
+          $content = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($manifestPath))
+          $contentsUri = "$base/contents/latest.json"
+          $existing = $null
+          try { $existing = Invoke-RestMethod -Method Get -Uri "$contentsUri`?ref=main" -Headers $headers }
+          catch {
+            if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+          }
+          $pointerBody = @{ message = "Update signed updater manifest for $($env:RELEASE_TAG)"; content = $content; branch = 'main' }
+          if ($existing -and $existing.sha) { $pointerBody.sha = $existing.sha }
+          $pointerCommit = Invoke-RestMethod -Method Put -Uri $contentsUri -Headers $headers -ContentType 'application/vnd.github+json' -Body ($pointerBody | ConvertTo-Json -Depth 5)
+          if (-not $pointerCommit.commit.sha) { throw 'GitHub did not confirm publishing the updater manifest pointer.' }
+          Write-Host "Updated raw GitHub updater manifest pointer in commit $($pointerCommit.commit.sha)."
       - name: Remove installers from older releases
         shell: pwsh
         env:
