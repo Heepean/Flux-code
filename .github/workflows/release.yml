@@ -27,6 +27,7 @@ jobs:
           release_tag="$GITHUB_REF_NAME"
           release_tag="${release_tag#publish-}"
           release_tag="${release_tag#rebuild-}"
+          release_tag="${release_tag%-retry.*}"
           if [[ "$release_tag" != "v${version}" ]]; then
             echo "Tag $release_tag does not match version $version." >&2
             exit 1
