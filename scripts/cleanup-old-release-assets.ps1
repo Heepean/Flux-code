@@ -1,5 +1,7 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
-param()
+param(
+    [string]$CurrentReleaseTag
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -22,7 +24,7 @@ if ($token) {
 }
 
 $base = "https://api.github.com/repos/$repository"
-$currentTag = $env:GITHUB_REF_NAME
+$currentTag = if ($CurrentReleaseTag) { $CurrentReleaseTag } else { $env:GITHUB_REF_NAME }
 if ($currentTag -notmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
     Write-Host "Skipping release-asset cleanup for non-release ref '$currentTag'. Cleanup runs only after a versioned release is created."
     exit 0
