@@ -44,11 +44,19 @@ jobs:
           NOTES_FILE: .github/release-notes/v${{ steps.version.outputs.notes_version }}.md
         run: |
           set -euo pipefail
-          if ! release=$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null); then
+          if ! release=$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1); then
+            echo "Release lookup did not find a draft: ${release//$'\n'/ }"
             args=("$RELEASE_TAG" --draft --title "Flux Hands $RELEASE_TAG" --notes-file "$NOTES_FILE")
             if [[ "$RELEASE_TAG" == *-beta.* ]]; then args+=(--prerelease); fi
-            gh release create "${args[@]}"
-            release=$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG")
+            if ! create_result=$(gh release create "${args[@]}" 2>&1); then
+              echo "::error title=Draft release creation failed::${create_result//$'\n'/ }"
+              exit 1
+            fi
+            echo "$create_result"
+            if ! release=$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1); then
+              echo "::error title=Draft release lookup failed after creation::${release//$'\n'/ }"
+              exit 1
+            fi
           fi
           if [[ $(jq -r '.tag_name' <<<"$release") != "$RELEASE_TAG" || $(jq -r '.draft' <<<"$release") != true ]]; then
             echo "::error title=Unexpected release state::Release $RELEASE_TAG exists but is not the expected draft."
