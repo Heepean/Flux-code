@@ -45,8 +45,9 @@ jobs:
           NOTES_FILE: .github/release-notes/v${{ steps.version.outputs.notes_version }}.md
         run: |
           set -euo pipefail
-          if ! release=$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1); then
-            echo "Release lookup did not find a draft: ${release//$'\n'/ }"
+          releases=$(gh api "repos/$REPOSITORY/releases?per_page=100")
+          release=$(jq -c --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0] // empty' <<<"$releases")
+          if [[ -z "$release" ]]; then
             args=("$RELEASE_TAG" --draft --title "Flux Hands $RELEASE_TAG" --notes-file "$NOTES_FILE")
             if [[ "$RELEASE_TAG" == *-beta.* ]]; then args+=(--prerelease); fi
             if ! create_result=$(gh release create "${args[@]}" 2>&1); then
@@ -54,10 +55,12 @@ jobs:
               exit 1
             fi
             echo "$create_result"
-            if ! release=$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1); then
-              echo "::error title=Draft release lookup failed after creation::${release//$'\n'/ }"
-              exit 1
-            fi
+            releases=$(gh api "repos/$REPOSITORY/releases?per_page=100")
+            release=$(jq -c --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0] // empty' <<<"$releases")
+          fi
+          if [[ -z "$release" ]]; then
+            echo "::error title=Draft release lookup failed::Could not find a draft release for $RELEASE_TAG after listing releases."
+            exit 1
           fi
           if [[ $(jq -r '.tag_name' <<<"$release") != "$RELEASE_TAG" || $(jq -r '.draft' <<<"$release") != true ]]; then
             echo "::error title=Unexpected release state::Release $RELEASE_TAG exists but is not the expected draft."
